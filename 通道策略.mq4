@@ -1,25 +1,25 @@
 #property copyright "TONGYI Lingma"
-#property version   "5.0"  // 终极优化版
+#property version   "6.2"  // 终极稳定版
 #property strict
 #property show_inputs
 
 //---- 通道参数
-input int     ChannelPeriod   = 20;       // 计算周期
-input double  ATRMultiplier   = 2.0;      // 波动系数
+input int     ChannelPeriod   = 20;       // 计算周期(20-50)
+input double  ATRMultiplier   = 2.0;      // 波动系数(0.5-3.0)
 
 //---- 风险参数  
 input double  Lots            = 0.01;     // 交易手数
-input int     StopLoss        = 400;      // 止损点数
+input int     StopLoss        = 400;      // 止损点数(50-1000)
 input int     TakeProfit      = 800;      // 止盈点数
-input double  MaxSpread       = 3.0;      // 最大允许点差(点)
+input double  MaxSpread       = 3.0;      // 最大点差
 input double  DailyMaxLoss    = 500.0;    // 单日最大亏损(USD)
 
 //---- 执行参数
 input int     MaxSlippage     = 5;        // 最大滑点
 input int     MaxOrders       = 1;        // 最大订单数
-input string  ExpirationDate  = "2024-12-31"; // 挂单有效期
-input string  TradingStart    = "02:00";  // 交易时段开始
-input string  TradingEnd      = "22:00";  // 交易时段结束
+input string  ExpirationDate  = "2028-12-31"; // 挂单有效期
+input string  TradingStart    = "06:00";  // 交易时段开始
+input string  TradingEnd      = "05:00";  // 交易时段结束
 input bool    EnableTrailing  = true;     // 启用移动止损
 
 //---- 系统参数
@@ -50,7 +50,7 @@ int OnInit()
         return(INIT_FAILED);
     }
     
-    // 增强版品种校验
+    // 品种校验
     string baseCurrency = SymbolInfoString(tradeSymbol, SYMBOL_CURRENCY_BASE);
     string quoteCurrency = SymbolInfoString(tradeSymbol, SYMBOL_CURRENCY_PROFIT);
     if((baseCurrency != "XAU" || quoteCurrency != "USD") && 
@@ -59,7 +59,7 @@ int OnInit()
         return(INIT_FAILED);
     }
     
-    // 特殊报价处理
+    // 报价处理
     int digits = (int)SymbolInfoInteger(tradeSymbol, SYMBOL_DIGITS);
     pointCoefficient = (digits == 3 || digits == 5) ? 10 * Point() : Point();
     
@@ -80,59 +80,135 @@ int OnInit()
 }
 
 //+------------------------------------------------------------------+
-//| 主交易逻辑                                                      |
+//| 核心交易逻辑                                                    |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    // 基础校验
-    if(IsStopped() || Bars < ChannelPeriod+10 || IsTradeContextBusy()) return;
-    
-    // 每日亏损检查
-    if(CheckDailyLoss() >= DailyMaxLoss){
+    if(!RiskCheck()) {
         CloseAllOrders();
         return;
     }
     
-    // 时段过滤
-    if(!IsTradeTime(TradingStart, TradingEnd) && OrdersTotal() == 0) return;
+    if(!ExecuteChecks()) return;
     
-    // NewBar检测
-    if(!IsNewBar()) return;
-    
-    // 同步报价
     MqlTick lastTick;
-    if(!SymbolInfoTick(tradeSymbol, lastTick)) {
-        Print("报价获取失败!");
-        return;
-    }
+    if(!GetMarketData(lastTick)) return;
     
-    // 点差过滤
-    double currentSpread = (lastTick.ask - lastTick.bid)/Point();
-    if(currentSpread > MaxSpread){
-        Comment("点差过大:",DoubleToString(currentSpread,1));
-        return;
-    }
-    
-    // 计算通道
     CalculateChannel();
-    
-    // 订单管理
     ManageOrders();
-    CleanExpiredOrders();
+    CheckBreakoutSignals(lastTick);
     
-    // 交易信号
-    if(CurrentOrders() < MaxOrders){
-        CheckBreakoutSignals(lastTick);
-    }
-    
-    // 显示面板
     if(IsVisualMode()) ShowInfoPanel();
 }
 
 //+------------------------------------------------------------------+
-//| 动态通道计算函数（增强版）                                      |
+//| 统一校验系统                                                    |
 //+------------------------------------------------------------------+
-void CalculateChannel()
+bool ExecuteChecks()
+{
+    static datetime lastCheckTime = 0;
+    if(TimeCurrent() - lastCheckTime < 1) return true;
+    
+    bool pass = true;
+    pass &= !IsStopped();
+    pass &= (Bars >= ChannelPeriod+10);
+    pass &= (CheckDailyLoss() < DailyMaxLoss);
+    pass &= IsTradeTime(TradingStart, TradingEnd);
+    pass &= IsNewBar();
+    pass &= (GetCurrentSpread() <= MaxSpread);
+    
+    lastCheckTime = TimeCurrent();
+    return pass;
+}
+
+//+------------------------------------------------------------------+
+//| 安全订单发送函数                                                |
+//+------------------------------------------------------------------+
+bool SafeOrderSend(int cmd, double price, double sl, double tp)
+{
+    int retry = 0;
+    while(retry < 3) {
+        if(IsTradeAllowed() && !IsTradeContextBusy()) {
+            MqlTradeRequest request={0};
+            MqlTradeResult result={0};
+            
+            request.action = TRADE_ACTION_PENDING;
+            request.symbol = tradeSymbol;
+            request.volume = Lots;
+            request.type = (ENUM_ORDER_TYPE)cmd;
+            request.price = NormalizePrice(price);
+            request.sl = NormalizePrice(sl);
+            request.tp = NormalizePrice(tp);
+            request.deviation = MaxSlippage;
+            request.magic = MagicNumber;
+            request.expiration = StringToTime(ExpirationDate);
+            
+            if(OrderSend(request, result)) {
+                Log(StringFormat("订单成功 类型:%d 价格:%.5f",cmd,price));
+                return true;
+            }
+            LogError("订单失败", GetLastError());
+        }
+        Sleep(300 + MathRand()%200);
+        retry++;
+    }
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| 智能参数优化系统                                                |
+//+------------------------------------------------------------------+
+void OptimizeParameters()
+{
+    static datetime lastOptimize = 0;
+    if(TimeCurrent() - lastOptimize < 3600) return;
+    
+    double atr = GetATRValue();
+    if(atr > 0.0003 && atr < 0.005) {
+        double ratio = MathMin(atr/0.0015, 2.0);
+        StopLoss = (int)MathCeil(StopLoss * ratio);
+        StopLoss = MathMin(StopLoss, 1000); // 硬性限制
+        TakeProfit = StopLoss * 2;
+        ATRMultiplier = NormalizeDouble(2.5 - (atr*800), 1);
+        ATRMultiplier = MathClamp(ATRMultiplier, 0.5, 3.0);
+    }
+    lastOptimize = TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| 增强风控系统                                                   |
+//+------------------------------------------------------------------+
+bool RiskCheck()
+{
+    // 净值保护
+    if(AccountBalance() <= 0 || (AccountEquity()/MathMax(AccountBalance(),0.01)) < 0.7) {
+        Log("账户净值异常");
+        return false;
+    }
+    
+    // 流动性检测
+    if(MarketInfo(tradeSymbol, MODE_SPREAD) > MaxSpread*2) {
+        Log("市场流动性不足");
+        return false;
+    }
+    
+    // 波动率过滤
+    if(IsMarketAbnormal()) {
+        Log("市场波动异常");
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| 核心功能函数实现                                               |
+//+------------------------------------------------------------------+
+double NormalizePrice(double price) {
+    return NormalizeDouble(price, (int)SymbolInfoInteger(tradeSymbol, SYMBOL_DIGITS));
+}
+
+void CalculateChannel() 
 {
     static datetime lastCalcTime = 0;
     if(Time[0] == lastCalcTime) return;
@@ -215,23 +291,20 @@ void CalculateChannel()
 }
 
 //+------------------------------------------------------------------+
-//| 辅助函数 - 计算数组平均值                                        |
+//| 市场数据获取函数                                                |
 //+------------------------------------------------------------------+
-double ArrayAverage(const double &arr[])
+bool GetMarketData(MqlTick &tick)
 {
-    double sum = 0;
-    int count = 0;
-    for(int i=0; i<ArraySize(arr); i++){
-        if(arr[i] > 0){
-            sum += arr[i];
-            count++;
-        }
-    }
-    return (count>0) ? sum/count : 0;
+    static datetime lastGetTime = 0;
+    if(TimeCurrent() - lastGetTime < 1) return true;
+    
+    bool success = SymbolInfoTick(tradeSymbol, tick);
+    if(success) lastGetTime = TimeCurrent();
+    return success;
 }
 
 //+------------------------------------------------------------------+
-//| 智能订单管理（增强版）                                          |
+//| 订单管理增强版                                                  |
 //+------------------------------------------------------------------+
 void ManageOrders()
 {
@@ -244,20 +317,58 @@ void ManageOrders()
             // 移动止损逻辑
             if(EnableTrailing) TrailStopLoss();
             
-            // 回撤保护
-            if(OrderProfit() < -AccountEquity()*0.02){
+            // 回撤保护（动态阈值）
+            double equityRatio = MathAbs(OrderProfit()/AccountEquity());
+            if(equityRatio > 0.02 && equityRatio < 0.05){
                 CloseOrder(OrderTicket());
+                Log("触发动态回撤保护");
             }
         }
     }
 }
 
 //+------------------------------------------------------------------+
-//| 突破信号检测（带新闻过滤）                                      |
+//| 移动止损函数（带滑点保护）                                      |
+//+------------------------------------------------------------------+
+void TrailStopLoss()
+{
+    if(!OrderSelect(OrderTicket(), SELECT_BY_TICKET)) return;
+    
+    double newStop = 0;
+    double currentPrice = 0;
+    double slippage = Point() * MaxSlippage;
+    
+    if(OrderType() == OP_BUY) {
+        currentPrice = NormalizeBid();
+        newStop = currentPrice - StopLoss*pointCoefficient;
+        newStop = MathMax(newStop, OrderStopLoss() + slippage);
+    }
+    else if(OrderType() == OP_SELL) {
+        currentPrice = NormalizeAsk();
+        newStop = currentPrice + StopLoss*pointCoefficient;
+        newStop = MathMin(newStop, OrderStopLoss() - slippage);
+    }
+    
+    if(MathAbs(newStop - OrderStopLoss()) > Point()/2){
+        if(!OrderModify(OrderTicket(), OrderOpenPrice(), 
+           NormalizePrice(newStop), OrderTakeProfit(), 0)){
+            LogError("移动止损失败", GetLastError());
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 突破信号检测（带成交量过滤）                                    |
 //+------------------------------------------------------------------+
 void CheckBreakoutSignals(const MqlTick &tick)
 {
     if(IsHighImpactNews()) return;
+    
+    // 成交量验证
+    if(iVolume(tradeSymbol, PERIOD_CURRENT, 0) < 100) {
+        Print("成交量不足跳过交易");
+        return;
+    }
     
     double ask = NormalizePrice(tick.ask);
     double bid = NormalizePrice(tick.bid);
@@ -315,34 +426,6 @@ double CheckDailyLoss()
     return dailyLoss;
 }
 
-//+------------------------------------------------------------------+
-//| 移动止损函数                                                    |
-//+------------------------------------------------------------------+
-void TrailStopLoss()
-{
-    if(!OrderSelect(OrderTicket(), SELECT_BY_TICKET)) return;
-    
-    double newStop = 0;
-    double currentPrice = 0;
-    
-    if(OrderType() == OP_BUY) {
-        currentPrice = NormalizeBid();
-        newStop = currentPrice - StopLoss*pointCoefficient;
-        newStop = MathMax(newStop, OrderStopLoss());
-    }
-    else if(OrderType() == OP_SELL) {
-        currentPrice = NormalizeAsk();
-        newStop = currentPrice + StopLoss*pointCoefficient;
-        newStop = MathMin(newStop, OrderStopLoss());
-    }
-    
-    if(MathAbs(newStop - OrderStopLoss()) > Point()/2){
-        if(!OrderModify(OrderTicket(), OrderOpenPrice(), 
-           NormalizePrice(newStop), OrderTakeProfit(), 0)){
-            LogError("移动止损失败", GetLastError());
-        }
-    }
-}
 
 //+------------------------------------------------------------------+
 //| 关闭所有订单函数                                                |
@@ -390,25 +473,6 @@ bool IsHighImpactNews()
         return true;
         
     return false;
-}
-
-//+------------------------------------------------------------------+
-//| 清理过期订单函数                                                |
-//+------------------------------------------------------------------+
-void CleanExpiredOrders()
-{
-    for(int i=OrdersTotal()-1; i>=0; i--)
-    {
-        if(OrderSelect(i, SELECT_BY_POS) && 
-           OrderMagicNumber() == MagicNumber &&
-           OrderSymbol() == tradeSymbol &&
-           OrderType() > OP_SELL)
-        {
-            datetime expiration = OrderExpiration();
-            if(expiration != 0 && expiration < TimeCurrent())
-                OrderDelete(OrderTicket());
-        }
-    }
 }
 
 //+------------------------------------------------------------------+
@@ -476,17 +540,3 @@ void LogError(string message, int errorCode)
     Print(TimeToString(TimeCurrent(),TIME_SECONDS)," 错误 ",errorCode,": ",message);
 }
 
-//+------------------------------------------------------------------+
-//| 交易时段判断函数                                                |
-//+------------------------------------------------------------------+
-bool IsTradeTime(string start, string end)
-{
-    datetime now = TimeCurrent();
-    datetime startTime = StringToTime(TimeToString(now,TIME_DATE)+" "+start);
-    datetime endTime = StringToTime(TimeToString(now,TIME_DATE)+" "+end);
-    
-    if(endTime < startTime) endTime += 86400; // 处理跨天
-    
-    return (now >= startTime) && (now <= endTime);
-}
-//+------------------------------------------------------------------+
