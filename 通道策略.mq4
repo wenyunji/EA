@@ -1,4 +1,4 @@
-#property copyright "TONGYI Lingma"
+#property copyright "WEN YUNJI"
 #property version   "6.2"  // 终极稳定版
 #property strict
 #property show_inputs
