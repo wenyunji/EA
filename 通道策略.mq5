@@ -1,4 +1,3 @@
-
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #property strict
@@ -6,26 +5,26 @@
 #property version   "6.3"
 
 //---- 输入参数 -----------------------------------------------------
-input int     ChannelPeriod   = 20;       // 通道计算周期
-input double  ATRMultiplier   = 2.0;      // ATR波动系数
-input double  Lots            = 0.01;     // 交易手数
-input int     StopLoss        = 400;      // 止损点数（基于Point计算）
-input int     TakeProfit      = 800;      // 止盈点数
-input double  MaxSpread       = 3.0;      // 允许的最大点差
-input double  DailyMaxLoss    = 500.0;    // 单日最大亏损金额
-input int     MaxSlippage     = 5;        // 最大滑点容忍度
-input int     MaxOrders       = 1;        // 最大同时持仓订单数
-input string  TradingStart    = "06:00";  // 交易时段开始时间
-input string  TradingEnd      = "05:00";  // 交易时段结束时间（支持跨日）
-input bool    EnableTrailing  = true;     // 启用移动止损
-input int     MagicNumber     = 202308;   // 魔术码（订单标识）
+input int     ChannelPeriod   = 34;       // 改为斐波那契数（原20）
+input double  ATRMultiplier   = 1.618;    // 黄金比例系数（原2.0）
+input double  Lots            = 0.01;    
+input int     StopLoss        = 250;      // 优化后的参数（原400）
+input int     TakeProfit      = 800;     
+input double  MaxSpread       = 3.0;     
+input double  DailyMaxLoss    = 500.0;   
+input int     MaxSlippage     = 5;       
+input int     MaxOrders       = 1;       
+input string  TradingStart    = "06:00"; 
+input string  TradingEnd      = "05:00"; 
+input bool    EnableTrailing  = true;    
+input int     MagicNumber     = 202308;  
 
 //---- 全局变量 -----------------------------------------------------
-double upperBand, lowerBand;              // 通道上下轨
-double pointCoefficient;                  // 点值计算系数
-int atrHandle;                            // ATR指标句柄
-string tradeSymbol;                       // 交易品种
-datetime lastBarTime;                     // 最后K线时间戳
+double upperBand, lowerBand;             
+double pointCoefficient;                 
+int atrHandle;                           
+string tradeSymbol;                      
+datetime lastBarTime;                    
 
 //+------------------------------------------------------------------+
 //| 专家初始化函数                                                   |
@@ -36,6 +35,13 @@ int OnInit()
     int digits = (int)SymbolInfoInteger(tradeSymbol, SYMBOL_DIGITS);
     pointCoefficient = (digits == 3 || digits == 5) ? 10 * Point() : Point();
     atrHandle = iATR(tradeSymbol, PERIOD_CURRENT, 14);
+    
+    // 创建通道可视化对象
+    ObjectCreate(0,"UpperBand",OBJ_TREND,0,0,0);
+    ObjectSetInteger(0,"UpperBand",OBJPROP_COLOR,clrRed);
+    ObjectCreate(0,"LowerBand",OBJ_TREND,0,0,0);
+    ObjectSetInteger(0,"LowerBand",OBJPROP_COLOR,clrBlue);
+    
     return (atrHandle != INVALID_HANDLE) ? INIT_SUCCEEDED : INIT_FAILED;
 }
 
@@ -44,16 +50,20 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    // 新K线验证机制
     datetime currentBar = iTime(_Symbol, PERIOD_CURRENT, 0);
     if(currentBar == lastBarTime) return;
     lastBarTime = currentBar;
 
-    // 实时监控输出
     static int tickCount = 0;
     if(tickCount++ % 100 == 0){
         Print(StringFormat("通道状态 | 上轨:%.5f 下轨:%.5f 现价:%.5f",
             upperBand, lowerBand, SymbolInfoDouble(tradeSymbol,SYMBOL_BID)));
+    }
+
+    // 新增报价验证
+    if(SymbolInfoDouble(_Symbol,SYMBOL_BID)==0 || SymbolInfoDouble(_Symbol,SYMBOL_ASK)==0){
+        Print("无效报价数据，跳过处理");
+        return;
     }
 
     if(!RiskCheck() || !ExecuteChecks()) return;
@@ -63,162 +73,56 @@ void OnTick()
         CalculateChannel();
         ManageOrders();
         CheckBreakoutSignals(lastTick);
-    }
-}
-
-//+------------------------------------------------------------------+
-//| 通道区间交易信号检测（关键修改）                                 |
-//+------------------------------------------------------------------+
-void CheckBreakoutSignals(const MqlTick &tick)
-{
-    if(PositionsTotal() >= MaxOrders) return;
-    
-    const double activationRatio = 0.2; // 激活范围比例（ATR的20%）
-    double atrValue = GetATRValue();
-    double activationRange = activationRatio * atrValue;
-    
-    double currentBid = tick.bid;
-    double currentAsk = tick.ask;
-
-    // 计算到通道边界的距离
-    double upperDistance = upperBand - currentBid; // 当前价到上轨的距离
-    double lowerDistance = currentAsk - lowerBand; // 当前价到下轨的距离
-
-    // 上轨附近开空（价格在上轨下方1个ATR范围内）
-    if(upperDistance > 0 && upperDistance < activationRange && !PositionExist(ORDER_TYPE_SELL)) 
-    {
-        Print(StringFormat("上轨附近开空 | 距离:%.5f ATR:%.5f", upperDistance, atrValue));
-        OpenPosition(ORDER_TYPE_SELL);
-    }
-    // 下轨附近开多（价格在下轨上方1个ATR范围内）
-    else if(lowerDistance > 0 && lowerDistance < activationRange && !PositionExist(ORDER_TYPE_BUY)) 
-    {
-        Print(StringFormat("下轨附近开多 | 距离:%.5f ATR:%.5f", lowerDistance, atrValue));
-        OpenPosition(ORDER_TYPE_BUY);
-    }
-}
-
-//+------------------------------------------------------------------+
-//| 动态止损止盈设置（基于通道位置）                                 |
-//+------------------------------------------------------------------+
-bool OpenPosition(ENUM_ORDER_TYPE orderType)
-{
-    CTrade trade;
-    trade.SetDeviationInPoints(MaxSlippage);
-
-    double price = (orderType == ORDER_TYPE_SELL) ? 
-                   SymbolInfoDouble(tradeSymbol, SYMBOL_BID) : 
-                   SymbolInfoDouble(tradeSymbol, SYMBOL_ASK);
-
-    // 动态止损止盈设置
-    double sl = (orderType == ORDER_TYPE_SELL) ? 
-                upperBand + StopLoss * pointCoefficient :  // 空单止损设在上轨上方
-                lowerBand - StopLoss * pointCoefficient;   // 多单止损设在下轨下方
-
-    double tp = (orderType == ORDER_TYPE_SELL) ? 
-                lowerBand - TakeProfit * pointCoefficient : // 空单止盈设在下轨附近
-                upperBand + TakeProfit * pointCoefficient;  // 多单止盈设在上轨附近
-
-    bool success = trade.PositionOpen(
-        tradeSymbol,
-        orderType,
-        Lots,
-        price,
-        NormalizePrice(sl),
-        NormalizePrice(tp),
-        "Channel Range Trading"
-    );
-
-    if(!success){
-        // 增强错误处理
-        int errorCode = trade.ResultRetcode();
-        Print("开单失败:",errorCode," ",trade.ResultRetcodeDescription());
         
-        // 特定错误处理
-        if(errorCode == 10014) { // ERR_TRADE_INVALID_STOPS
-            Print("建议调整止损点数，当前参数：",
-                  "StopLoss=",StopLoss," (",StopLoss*pointCoefficient,"点) ",
-                  "通道范围:",upperBand,"-",lowerBand);
-        }
+        // 新增图表注释
+        Comment(StringFormat("Upper: %.5f\nLower: %.5f\nATR: %.5f", 
+                 upperBand, lowerBand, GetATRValue()));
     }
-    return success;
 }
 
 //+------------------------------------------------------------------+
-//| 增强版通道计算（带有效性检查）                                   |
+//| 优化后的通道计算函数                                             |
 //+------------------------------------------------------------------+
 void CalculateChannel() 
 {
     double atrValue = GetATRValue();
-    if(atrValue <= 0) {
-        Print("ATR值无效:",atrValue);
-        return;
-    }
+    if(atrValue <= 0) return;
 
     double highs[], lows[];
     ArraySetAsSeries(highs, true);
     ArraySetAsSeries(lows, true);
 
-    int copiedHighs = CopyHigh(tradeSymbol, PERIOD_CURRENT, 1, ChannelPeriod, highs);
-    int copiedLows = CopyLow(tradeSymbol, PERIOD_CURRENT, 1, ChannelPeriod, lows);
+    // 修正数据获取方式（从当前Bar开始获取）
+    int copiedHighs = CopyHigh(tradeSymbol, PERIOD_CURRENT, 0, ChannelPeriod, highs);
+    int copiedLows = CopyLow(tradeSymbol, PERIOD_CURRENT, 0, ChannelPeriod, lows);
     
     if(copiedHighs == ChannelPeriod && copiedLows == ChannelPeriod)
     {
-        double baseHigh = highs[ArrayMaximum(highs)];
-        double baseLow = lows[ArrayMinimum(lows)];
+        int maxIndex = ArrayMaximum(highs);
+        int minIndex = ArrayMinimum(lows);
+        double baseHigh = highs[maxIndex];
+        double baseLow = lows[minIndex];
         
-        // 验证价格合理性
-        if(baseHigh <= baseLow || baseHigh <= 0 || baseLow <= 0) {
-            Print("通道计算异常 High:",baseHigh," Low:",baseLow);
+        // 新增时间有效性验证
+        datetime newestTime = iTime(tradeSymbol, PERIOD_CURRENT, 0);
+        if(TimeCurrent() - newestTime > PeriodSeconds(PERIOD_CURRENT)*2){
+            Print("通道数据过期！最新时间:",TimeToString(newestTime));
+            return;
+        }
+
+        // 新增通道宽度过滤
+        if(baseHigh - baseLow < atrValue*0.5){
+            Print("通道宽度不足 ATR:",atrValue," 通道宽度:",baseHigh-baseLow);
             return;
         }
         
         upperBand = NormalizeDouble(baseHigh + ATRMultiplier * atrValue, _Digits);
         lowerBand = NormalizeDouble(baseLow - ATRMultiplier * atrValue, _Digits);
         
-        // 更新通道可视化
+        // 增强可视化更新
         ObjectMove(0,"UpperBand",0,TimeCurrent(),upperBand);
         ObjectMove(0,"LowerBand",0,TimeCurrent(),lowerBand);
     }
-    else {
-        Print("历史数据获取失败 Highs:",copiedHighs," Lows:",copiedLows);
-    }
-}
-
-//+------------------------------------------------------------------+
-//| 持仓检查函数（精准版）                                           |
-//+------------------------------------------------------------------+
-bool PositionExist(ENUM_ORDER_TYPE checkType)
-{
-    for(int i = PositionsTotal()-1; i >= 0; i--)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(PositionSelectByTicket(ticket) && 
-           PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
-           PositionGetString(POSITION_SYMBOL) == tradeSymbol &&
-           PositionGetInteger(POSITION_TYPE) == checkType)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-//+------------------------------------------------------------------+
-//| 风险检查函数（唯一实现）                                         |
-//+------------------------------------------------------------------+
-bool RiskCheck()
-{
-    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-    
-    if(equity < balance - DailyMaxLoss) 
-    {
-        CloseAllOrders();
-        return false;
-    }
-    return (equity / MathMax(balance, 0.01)) >= 0.7 
-           && TerminalInfoInteger(TERMINAL_CONNECTED);
 }
 
 //+------------------------------------------------------------------+
@@ -246,14 +150,157 @@ void TrailStopLoss(ulong ticket)
 
 
 //+------------------------------------------------------------------+
-//| 其他保持不变的函数                                               |
+//| 风险检查函数（唯一实现）                                         |
+//+------------------------------------------------------------------+
+bool RiskCheck()
+{
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    
+    if(equity < balance - DailyMaxLoss) 
+    {
+        CloseAllOrders();
+        return false;
+    }
+    return (equity / MathMax(balance, 0.01)) >= 0.7 
+           && TerminalInfoInteger(TERMINAL_CONNECTED);
+}
+
+//+------------------------------------------------------------------+
+//| 持仓检查函数（精准版）                                           |
+//+------------------------------------------------------------------+
+bool PositionExist(ENUM_ORDER_TYPE checkType)
+{
+    for(int i = PositionsTotal()-1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(PositionSelectByTicket(ticket) && 
+           PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+           PositionGetString(POSITION_SYMBOL) == tradeSymbol &&
+           PositionGetInteger(POSITION_TYPE) == checkType)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| 优化后的信号检测函数                                             |
+//+------------------------------------------------------------------+
+void CheckBreakoutSignals(const MqlTick &tick)
+{
+    if(PositionsTotal() >= MaxOrders) return;
+    
+    const double activationRatio = 0.25; // 从0.2放宽到25%
+    double atrValue = GetATRValue();
+    if(atrValue <= 0) return;
+    
+    double activationRange = activationRatio * atrValue;
+    double currentBid = tick.bid;
+    double currentAsk = tick.ask;
+
+    // 优化后的触发条件
+    bool sellCondition = (upperBand - currentBid) > 0 && 
+                        (upperBand - currentBid) <= activationRange;
+    bool buyCondition = (currentAsk - lowerBand) > 0 && 
+                       (currentAsk - lowerBand) <= activationRange;
+
+    if(sellCondition && !PositionExist(ORDER_TYPE_SELL)) 
+    {
+        Print(StringFormat("触发空单 | 距离:%.5f ATR:%.5f", upperBand-currentBid, atrValue));
+        OpenPosition(ORDER_TYPE_SELL);
+    }
+    else if(buyCondition && !PositionExist(ORDER_TYPE_BUY)) 
+    {
+        Print(StringFormat("触发多单 | 距离:%.5f ATR:%.5f", currentAsk-lowerBand, atrValue));
+        OpenPosition(ORDER_TYPE_BUY);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 优化后的开仓函数                                                 |
+//+------------------------------------------------------------------+
+bool OpenPosition(ENUM_ORDER_TYPE orderType)
+{
+    CTrade trade;
+    trade.SetDeviationInPoints(MaxSlippage);
+
+    double price = (orderType == ORDER_TYPE_SELL) ? 
+                   SymbolInfoDouble(tradeSymbol, SYMBOL_BID) : 
+                   SymbolInfoDouble(tradeSymbol, SYMBOL_ASK);
+
+    // 动态止损计算（基于ATR）
+    double atrValue = GetATRValue();
+    double dynamicSL = MathMax(StopLoss, (int)(atrValue/Point()));
+
+    double sl = (orderType == ORDER_TYPE_SELL) ? 
+                upperBand + dynamicSL * pointCoefficient : 
+                lowerBand - dynamicSL * pointCoefficient;
+
+    double tp = (orderType == ORDER_TYPE_SELL) ? 
+                lowerBand - TakeProfit * pointCoefficient : 
+                upperBand + TakeProfit * pointCoefficient;
+
+    bool success = trade.PositionOpen(
+        tradeSymbol,
+        orderType,
+        Lots,
+        price,
+        NormalizePrice(sl),
+        NormalizePrice(tp),
+        "Optimized Channel Strategy"
+    );
+
+    if(!success){
+        int errorCode = trade.ResultRetcode();
+        Print("开单失败:",errorCode," ",trade.ResultRetcodeDescription());
+    }
+    return success;
+}
+
+//+------------------------------------------------------------------+
+//| 优化后的时间过滤函数                                             |
+//+------------------------------------------------------------------+
+bool IsTradeTime(string start, string end)
+{
+    datetime now = TimeCurrent();
+    datetime st = StringToTime(start);
+    datetime ed = StringToTime(end);
+    
+    // 处理跨日情况
+    if(st >= ed) ed += 86400;
+    
+    datetime nowTime = now % 86400;
+    st = st % 86400;
+    ed = ed % 86400;
+
+    if(ed > st) {
+        return (nowTime >= st) && (nowTime < ed);
+    } else {
+        return (nowTime >= st) || (nowTime < ed);
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| 增强版风控检查                                                   |
 //+------------------------------------------------------------------+
 bool ExecuteChecks()
 {
-    return Bars(_Symbol, PERIOD_CURRENT) >= ChannelPeriod+10 && 
+    // 新增成交量过滤
+    long volume = SymbolInfoInteger(tradeSymbol, SYMBOL_VOLUME);
+    if(volume < 1000) {
+        Print("成交量过低:",volume);
+        return false;
+    }
+    
+    return Bars(_Symbol, PERIOD_CURRENT) >= ChannelPeriod*2 && 
            IsTradeTime(TradingStart, TradingEnd) && 
            GetCurrentSpread() <= MaxSpread;
 }
+
+
 
 void ManageOrders()
 {
@@ -300,8 +347,6 @@ double GetCurrentSpread()
     return SymbolInfoInteger(tradeSymbol, SYMBOL_SPREAD) * Point();
 }
 
-bool IsTradeTime(string start, string end)
-{
-    datetime st = StringToTime(start), ed = StringToTime(end), now = TimeCurrent();
-    return (st < ed) ? (now >= st && now < ed) : (now >= st || now < ed);
-}
+
+
+
