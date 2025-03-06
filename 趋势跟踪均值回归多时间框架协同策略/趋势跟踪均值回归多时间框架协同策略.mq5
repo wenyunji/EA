@@ -8,8 +8,10 @@
 #property version   "3.0"
 #property strict
 
-#include <Trade\Trade.mql5>
-#include <Math\Stat\Math.mqh>
+#include <Trade\Trade.mqh>  
+#include <Trade\PositionInfo.mqh> 
+#include <Math\Stat\Math.mqh>  
+
 CTrade trade;
 
 //--- 输入参数
@@ -31,6 +33,9 @@ input double  DailyLossLimit       = 3.0;       // 每日最大亏损 (%)
 input int     MaxSlippage          = 10;        // 最大允许滑点 (点)
 input bool    EnableNewsFilter     = true;      // 启用新闻过滤器
 input bool    EnableLiquidityFilter= true;      // 启用流动性过滤器
+double dynamicATRMultiplier = ATR_Multiplier; // 动态ATR乘数
+double dynamicRiskPerTrade = RiskPerTrade;    // 动态风险比例
+
 
 //--- 全局变量
 int    emaFastHandle, emaSlowHandle, bbHandle, rsiHandle, atrHandle, adxHandle;
@@ -44,6 +49,8 @@ double dailyProfit;
 int OnInit()
 {
    // 初始化指标句柄
+   dynamicATRMultiplier = ATR_Multiplier;
+   dynamicRiskPerTrade = RiskPerTrade;
    emaFastHandle = iMA(_Symbol, TrendPeriod, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
    emaSlowHandle = iMA(_Symbol, TrendPeriod, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
    bbHandle = iBands(_Symbol, EntryPeriod, BB_Period, 0, BB_Deviation, PRICE_CLOSE);
@@ -135,6 +142,20 @@ double CalculateDynamicLotSize()
    return CalculateLotSize() * riskFactor;
 }
 
+void CloseAllPositions()
+{
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket>0 && 
+         PositionGetString(POSITION_SYMBOL)==_Symbol &&
+         PositionGetInteger(POSITION_MAGIC)==MagicNumber)
+      {
+         trade.PositionClose(ticket);
+      }
+   }
+}
+
 //+------------------------------------------------------------------+
 //| 每日亏损熔断                                                    |
 //+------------------------------------------------------------------+
@@ -152,9 +173,8 @@ void CheckDailyLossLimit()
 //+------------------------------------------------------------------+
 bool IsHighImpactNews()
 {
-   // 使用经济日历API或外部数据源
-   // 示例：假设有一个函数CheckNewsImpact()返回true表示有高影响新闻
-   return CheckNewsImpact();
+   //return CheckNewsImpact(); // 暂时注释未实现的功能
+   return false; // 暂时禁用新闻过滤器
 }
 
 //+------------------------------------------------------------------+
@@ -182,13 +202,13 @@ void AdjustStrategyParameters()
 
    if(adxVal[0] > 25) // 趋势市场
    {
-      ATR_Multiplier = 2.0; // 放宽止损
-      RiskPerTrade = 1.5;   // 增加风险暴露
+      dynamicATRMultiplier = 2.0; // 使用动态变量
+      dynamicRiskPerTrade = 1.5;  
    }
    else // 震荡市场
    {
-      ATR_Multiplier = 1.0; // 收紧止损
-      RiskPerTrade = 0.5;   // 减少风险暴露
+      dynamicATRMultiplier = 1.0;
+      dynamicRiskPerTrade = 0.5;  
    }
 }
 
@@ -226,14 +246,14 @@ ENUM_ORDER_TYPE GetEntrySignal()
 //+------------------------------------------------------------------+
 //| 管理仓位                                                        |
 //+------------------------------------------------------------------+
-void ManagePositions(bool trendDir, ENUM_ORDER_TYPE signal)
+void ManagePositions(bool trendIsBullish, ENUM_ORDER_TYPE signal) // 使用布尔值判断趋势
 {
-   if(trendDir == DIRECTION_BUY && signal == ORDER_TYPE_BUY)
+   if(trendIsBullish && signal == ORDER_TYPE_BUY)
    {
       ClosePositions(ORDER_TYPE_SELL);
       if(!PositionExists(ORDER_TYPE_BUY)) OpenPosition(ORDER_TYPE_BUY);
    }
-   else if(trendDir == DIRECTION_SELL && signal == ORDER_TYPE_SELL)
+   else if(!trendIsBullish && signal == ORDER_TYPE_SELL)
    {
       ClosePositions(ORDER_TYPE_BUY);
       if(!PositionExists(ORDER_TYPE_SELL)) OpenPosition(ORDER_TYPE_SELL);
@@ -254,12 +274,12 @@ void OpenPosition(ENUM_ORDER_TYPE orderType)
    if(orderType == ORDER_TYPE_BUY)
    {
       price = lastTick.ask;
-      sl = lastTick.bid - atr[0] * ATR_Multiplier;
+      sl = lastTick.bid - atr[0] * dynamicATRMultiplier; // 使用动态变量
    }
    else
    {
       price = lastTick.bid;
-      sl = lastTick.ask + atr[0] * ATR_Multiplier;
+      sl = lastTick.ask + atr[0] * dynamicATRMultiplier; // 使用动态变量
    }
 
    trade.PositionOpen(_Symbol, orderType, lotSize, price, sl, tp);
@@ -295,12 +315,12 @@ void TrailingStop()
 //+------------------------------------------------------------------+
 double CalculateLotSize()
 {
-   double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPerTrade / 100.0;
+   double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * dynamicRiskPerTrade / 100.0; // 动态参数
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double atrVal[1];
 
    CopyBuffer(atrHandle, 0, 0, 1, atrVal);
-   double riskLots = riskAmount / (atrVal[0] * ATR_Multiplier / _Point * tickValue);
+   double riskLots = riskAmount / (atrVal[0] * dynamicATRMultiplier / _Point * tickValue); // 动态参数
 
    return NormalizeDouble(riskLots, 2);
 }
