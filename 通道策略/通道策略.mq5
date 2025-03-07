@@ -8,17 +8,19 @@
 #property strict
 
 #include <Trade\Trade.mqh>
+#include <Math\Stat\Math.mqh> // 添加数学库
+
 CTrade trade;
 
 //--- 输入参数
 input int      ChannelPeriod    = 50;       // 通道计算周期（根K线）
-input int      EntryThreshold   = 300;      // 入场阈值（点）
+input int      EntryThreshold   = 200;      // 入场阈值（点）[优化范围]
 input int      ExitThreshold    = 100;      // 平仓阈值（点）
 input int      StopLoss         = 500;      // 止损点数
 input double   RiskPercent      = 2.0;      // 每单风险比例（%）
 input int      ATR_Period       = 14;       // ATR波动率周期
 input double   VolatilityFilter = 1.5;      // 最大允许波动（ATR倍数）
-input int      VolumeFilter     = 100;      // 成交量放大阈值（%）
+input int      VolumeFilter     = 80;       // 成交量放大阈值（%）[优化范围]
 
 //--- 全局变量
 double upperChannel, lowerChannel;
@@ -34,6 +36,13 @@ int OnInit()
    trade.SetExpertMagicNumber(magicNumber);
    trade.SetMarginMode();
    trade.SetTypeFillingBySymbol(Symbol());
+   
+   // 正确初始化ATR句柄（修复点1）
+   atrHandle = iATR(Symbol(), PERIOD_CURRENT, ATR_Period);
+   if(atrHandle == INVALID_HANDLE){
+      Alert("ATR指标初始化失败!");
+      return(INIT_FAILED);
+   }
    return(INIT_SUCCEEDED);
 }
 
@@ -42,14 +51,10 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   atrHandle = iATR(Symbol(), PERIOD_CURRENT, ATR_Period); // 正确参数数量
-   if(atrHandle == INVALID_HANDLE){
-      Alert("ATR指标初始化失败!");
-      return;
-   }
-   // 确保新K线开始执行
-   if(TimeCurrent() == lastBarTime) return;
-   lastBarTime = TimeCurrent();
+   // 正确的新K线检测逻辑（修复点2）
+   datetime currentBarTime = iTime(Symbol(), PERIOD_CURRENT, 0);
+   if(currentBarTime == lastBarTime) return;
+   lastBarTime = currentBarTime;
 
    // 更新通道值
    UpdateChannel();
@@ -62,62 +67,71 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| 更新通道值                                                      |
+//| 更新通道值（修复版）                                            |
 //+------------------------------------------------------------------+
 void UpdateChannel()
 {
-
-   // 获取最近ChannelPeriod根K线的高低点
-   double highs[];
-   double lows[];
-   CopyHigh(Symbol(), PERIOD_CURRENT, 0, ChannelPeriod, highs);
-   CopyLow(Symbol(), PERIOD_CURRENT, 0, ChannelPeriod, lows);
+   double highs[], lows[];
+   // 获取已闭合K线数据（修复点3）
+   if(CopyHigh(Symbol(), PERIOD_CURRENT, 1, ChannelPeriod, highs) < ChannelPeriod || 
+      CopyLow(Symbol(), PERIOD_CURRENT, 1, ChannelPeriod, lows) < ChannelPeriod)
+   {
+      Print("通道数据不足");
+      return;
+   }
    
    upperChannel = highs[ArrayMaximum(highs)];
    lowerChannel = lows[ArrayMinimum(lows)];
-   if(ArraySize(highs) < ChannelPeriod || ArraySize(lows) < ChannelPeriod){
-   Print("通道数据不足");
-   return;
-   }
-   // 转换为当前价格坐标系
+   
+   // 调试输出（新增点）
+   Print(StringFormat("通道值更新：Upper=%.5f Lower=%.5f", upperChannel, lowerChannel));
+   
    upperChannel = NormalizeDouble(upperChannel, _Digits);
    lowerChannel = NormalizeDouble(lowerChannel, _Digits);
 }
 
 //+------------------------------------------------------------------+
-//| 检查入场条件（完整修复版）                                      |
+//| 检查入场条件（优化版）                                          |
 //+------------------------------------------------------------------+
 void CheckEntryConditions()
 {
    double currentPrice = SymbolInfoDouble(Symbol(), SYMBOL_BID);
    long volume = iVolume(Symbol(), PERIOD_CURRENT, 0);
    
-   // 获取ATR值
-   double atrValues[2];
-   if(CopyBuffer(atrHandle, 0, 0, 2, atrValues) < 2){
+   double atrValues[3];
+   if(CopyBuffer(atrHandle, 0, 0, 3, atrValues) < 3){
       Print("获取ATR数据失败");
       return;
    }
 
-   // 波动率过滤
-   if(atrValues[0] > VolatilityFilter * atrValues[1])
+   // 优化波动率过滤（修复点4）
+   double atrAverage = MathMean(atrValues);
+   if(atrValues[0] > VolatilityFilter * atrAverage){
+      Print("波动率过滤触发：当前ATR(",atrValues[0],") > 过滤值(",VolatilityFilter * atrAverage,")");
       return;
+   }
 
-   // 成交量过滤
-   if(volume < (iVolume(Symbol(), PERIOD_CURRENT, 1) * VolumeFilter / 100))
+   // 优化成交量过滤
+   long prevVolume = iVolume(Symbol(), PERIOD_CURRENT, 1);
+   if(volume < (prevVolume * VolumeFilter / 100)){
+      Print(StringFormat("成交量过滤：当前量%d < 前量%d的%d%%", volume, prevVolume, VolumeFilter));
       return;
+   }
 
-   // 入场阈值计算
    double entryUpper = upperChannel + EntryThreshold * _Point;
    double entryLower = lowerChannel - EntryThreshold * _Point;
+   
+   // 调试输出（新增点）
+   Print(StringFormat("当前价:%.5f 上轨突破点:%.5f 下轨突破点:%.5f", 
+         currentPrice, entryUpper, entryLower));
 
-   // 多空入场判断
    if(currentPrice <= entryLower && !PositionExists(POSITION_TYPE_BUY))
       OpenPosition(ORDER_TYPE_BUY);
       
    if(currentPrice >= entryUpper && !PositionExists(POSITION_TYPE_SELL))
       OpenPosition(ORDER_TYPE_SELL);
 }
+
 
 //+------------------------------------------------------------------+
 //| 开仓函数（类型修复版）                                          |
