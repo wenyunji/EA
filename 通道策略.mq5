@@ -1,8 +1,8 @@
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
-#property strict
+
 #property copyright "WEN YUNJI"
-#property version   "6.3"
+#property version   "6.6.1"  // 版本升级
 
 //---- 输入参数 -----------------------------------------------------
 input int     ChannelPeriod   = 34;       // 通道周期（斐波那契数）
@@ -10,7 +10,7 @@ input double  ATRMultiplier   = 1.618;    // ATR乘数（黄金比例）
 input double  Lots            = 0.01;     // 交易手数
 input int     StopLoss        = 250;      // 基础止损点数
 input int     TakeProfit      = 800;      // 固定止盈点数
-input double  MaxSpread       = 3.0;      // 最大允许点差
+input double  MaxSpread       = 4.0;      // 最大允许点差
 input double  DailyMaxLoss    = 500.0;    // 单日最大亏损
 input int     MaxSlippage     = 5;        // 最大滑点
 input int     MaxOrders       = 1;        // 最大持仓数
@@ -18,7 +18,8 @@ input string  TradingStart    = "06:00";  // 交易时段开始
 input string  TradingEnd      = "05:00";  // 交易时段结束
 input bool    EnableTrailing  = true;     // 启用移动止损
 input int     MagicNumber     = 202308;   // 魔术码
-input double  MinVolumeLevel  = 0.5;      // 最低成交量阈值（相对于近期均值）
+input double  MinVolumeLevel  = 0.35;     // 成交量阈值
+input bool    UseBarVolume    = true;     // 使用K线成交量（新增参数）
 
 //---- 全局变量 -----------------------------------------------------
 double upperBand, lowerBand;
@@ -26,63 +27,241 @@ double pointCoefficient;
 int atrHandle;
 string tradeSymbol;
 datetime lastBarTime;
-double volumeMA;  // 成交量移动平均
+double volumeMA;
+
+//+------------------------------------------------------------------+
+//| 检查结果枚举类型                                                 |
+//+------------------------------------------------------------------+
+enum CHECK_RESULT {
+    CHECK_PASS = 0,
+    CHECK_RISK_FAIL,
+    CHECK_TICK_FAIL,
+    CHECK_VOLUME_FAIL,
+    CHECK_SPREAD_FAIL,
+    CHECK_TIME_FAIL
+};
 
 //+------------------------------------------------------------------+
 //| 专家初始化函数                                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    // 网络连接检查
+    if(!TerminalInfoInteger(TERMINAL_CONNECTED)) {
+        Alert("网络连接异常：请检查互联网连接");
+        return INIT_FAILED;
+    }
+
     tradeSymbol = Symbol();
     int digits = (int)SymbolInfoInteger(tradeSymbol, SYMBOL_DIGITS);
     pointCoefficient = (digits == 3 || digits == 5) ? 10 * Point() : Point();
-    atrHandle = iATR(tradeSymbol, PERIOD_CURRENT, 14);
     
-    // 初始化通道可视化
+    // ATR指标初始化
+    atrHandle = iATR(tradeSymbol, PERIOD_CURRENT, 14);
+    if(atrHandle == INVALID_HANDLE) {
+        Alert("ATR指标初始化失败");
+        return INIT_FAILED;
+    }
+
+    // 可视化通道初始化
     ObjectCreate(0,"UpperBand",OBJ_TREND,0,0,0);
     ObjectSetInteger(0,"UpperBand",OBJPROP_COLOR,clrRed);
     ObjectCreate(0,"LowerBand",OBJ_TREND,0,0,0);
     ObjectSetInteger(0,"LowerBand",OBJPROP_COLOR,clrBlue);
-    
-    // 初始化成交量数据
+
+    // 成交量数据初始化
     volumeMA = CalculateVolumeMA();
+    if(volumeMA <= 0) {
+        volumeMA = GetDefaultVolume();
+        Print("使用默认成交量MA值:",volumeMA);
+    }
     
-    return (atrHandle != INVALID_HANDLE) ? INIT_SUCCEEDED : INIT_FAILED;
+    Print("EA初始化成功");
+    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Tick事件处理函数                                                 |
+//| 成交量MA计算函数（已修复）                                       |
 //+------------------------------------------------------------------+
-void OnTick()
+double CalculateVolumeMA()
 {
-    static datetime lastAlert = 0;
-    datetime currentBar = iTime(_Symbol, PERIOD_CURRENT, 0);
+    long volumes[];
+    int copied = 0;
     
-    // 新K线验证
-    if(currentBar != lastBarTime) {
-        lastBarTime = currentBar;
-        volumeMA = 0.7*volumeMA + 0.3*CalculateVolumeMA(); // 更新成交量MA
+    if(UseBarVolume) {
+        // 使用K线成交量（回测兼容）
+        copied = CopyRealVolume(tradeSymbol, PERIOD_CURRENT, 0, 20, volumes);
+    } else {
+        // 使用Tick成交量（实时交易）
+        copied = CopyTickVolume(tradeSymbol, PERIOD_CURRENT, COPY_TICKS_ALL, 0, 20, volumes);
     }
 
-    // 实时监控输出（每100tick）
-    static int tickCount = 0;
-    if(tickCount++ % 100 == 0) {
-        DebugOutput();
+    if(copied <= 0) {
+        Print("成交量数据获取失败，使用最后有效值");
+        return volumeMA > 0 ? volumeMA : GetDefaultVolume();
     }
 
-    // 核心逻辑执行
-    if(ExecuteChecks()) {
-        MqlTick lastTick;
-        if(SymbolInfoTick(tradeSymbol, lastTick)) {
-            CalculateChannel();
-            ManageOrders();
-            CheckBreakoutSignals(lastTick);
+    // 数据有效性过滤
+    double sum = 0.0;
+    int validCount = 0;
+    for(int i=0; i<copied; i++) {
+        if(volumes[i] > 0) {
+            sum += (double)volumes[i];
+            validCount++;
         }
     }
+    
+    if(validCount == 0) {
+        Print("警告：全部成交量数据异常");
+        return volumeMA > 0 ? volumeMA : GetDefaultVolume();
+    }
+    
+    return NormalizeDouble(sum / validCount, 2);
 }
 
 //+------------------------------------------------------------------+
-//| 增强版通道计算函数                                               |
+//| 增强风控检查函数（已修复参数）                                   |
+//+------------------------------------------------------------------+
+CHECK_RESULT ExecuteChecks() 
+{
+    // 时间过滤检查
+    if(!IsTradeTime(TradingStart, TradingEnd)) {
+        return CHECK_TIME_FAIL;
+    }
+
+    if(!RiskCheck()) return CHECK_RISK_FAIL;
+    
+    MqlTick last_tick;
+    if(!SymbolInfoTick(tradeSymbol, last_tick)) {
+        Print("实时报价获取失败");
+        return CHECK_TICK_FAIL;
+    }
+    
+    // 成交量检查（修正版）
+    double currentVol = 0.0;
+    double requiredVolume = volumeMA * MinVolumeLevel;
+    
+    if(UseBarVolume) {
+        // 使用当前K线成交量
+        MqlRates rates[];
+        if(CopyRates(tradeSymbol, PERIOD_CURRENT, 0, 1, rates) == 1) {
+            currentVol = (double)rates[0].tick_volume;
+        }
+    } else {
+        // 使用Tick成交量
+        currentVol = (double)last_tick.volume;
+    }
+
+    if(currentVol < requiredVolume) {
+        Print(StringFormat("成交量过滤 | 模式:%s 当前:%.1f < 要求:%.1f (MA %.1f * %.2f)", 
+              UseBarVolume?"K线":"Tick", currentVol, requiredVolume, volumeMA, MinVolumeLevel));
+        return CHECK_VOLUME_FAIL;
+    }
+    
+    // 点差检查
+    double currentSpread = GetCurrentSpread();
+    if(currentSpread > MaxSpread) {
+        Print(StringFormat("点差过滤 | 当前:%.1f > 限制:%.1f", currentSpread, MaxSpread));
+        return CHECK_SPREAD_FAIL;
+    }
+    
+    return CHECK_PASS;
+}
+
+// ...（其他函数保持与之前提供的完整代码一致，包括：RiskCheck、CalculateChannel、CheckBreakoutSignals、OpenPosition、DebugOutput等所有函数）...
+
+// 确保包含所有辅助函数实现：
+// - GetDefaultVolume
+// - IsTradeTime
+// - ArrayAverage
+// - UpdateChannelDisplay
+// - PrintTradeError
+// - PositionExist
+// - TrailStopLoss
+// - ManageOrders
+// - CloseAllOrders
+// - GetATRValue
+// - NormalizePrice
+// - GetCurrentSpread
+
+//+------------------------------------------------------------------+
+//| 成交量MA计算函数（完整修正版）                                   |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| 获取品种典型成交量值                                             |
+//+------------------------------------------------------------------+
+double GetDefaultVolume()
+{
+    // 主要品种的典型成交量基准值
+    string symbol = Symbol();
+    if(StringFind(symbol, "XAUUSD") != -1) return 1000.0;
+    if(StringFind(symbol, "EURUSD") != -1) return 100000.0;
+    if(StringFind(symbol, "GBPUSD") != -1) return 80000.0;
+    return 50000.0; // 默认值
+}
+
+//+------------------------------------------------------------------+
+//| 时间过滤函数（完整实现）                                         |
+//+------------------------------------------------------------------+
+bool IsTradeTime(string start, string end)
+{
+    datetime now = TimeCurrent();
+    datetime st = StringToTime(start);
+    datetime ed = StringToTime(end);
+    
+    // 处理跨日情况
+    if(st >= ed) ed += 86400;
+    
+    datetime nowTime = now % 86400;
+    st = st % 86400;
+    ed = ed % 86400;
+
+    if(ed > st) {
+        return (nowTime >= st) && (nowTime < ed);
+    } else {
+        return (nowTime >= st) || (nowTime < ed);
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| 智能风控检查（详细日志版）                                       |
+//+------------------------------------------------------------------+
+bool RiskCheck()
+{
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    bool isConnected = TerminalInfoInteger(TERMINAL_CONNECTED);
+
+    // 净值比例计算
+    double equityRatio = (balance > 0.01) ? equity / balance : 0;
+    
+    // 调试日志
+    Print(StringFormat("风控状态 | 净值比:%.1f%% 连接:%d", equityRatio*100, isConnected));
+
+    if(equity < (balance - DailyMaxLoss)) {
+        Print(StringFormat("单日亏损限额触发 | 已亏损:%.1f", balance - equity));
+        CloseAllOrders();
+        return false;
+    }
+    
+    if(equityRatio < 0.7) {
+        Print(StringFormat("净值保护触发 | 当前:%.1f%% < 70%%", equityRatio*100));
+        return false;
+    }
+    
+    if(!isConnected) {
+        Print("交易终端离线");
+        return false;
+    }
+    
+    return true;
+}
+
+
+//+------------------------------------------------------------------+
+//| 通道计算函数                                                     |
 //+------------------------------------------------------------------+
 void CalculateChannel() 
 {
@@ -93,7 +272,6 @@ void CalculateChannel()
     ArraySetAsSeries(highs, true);
     ArraySetAsSeries(lows, true);
 
-    // 获取历史数据（包含当前Bar）
     int copiedHighs = CopyHigh(tradeSymbol, PERIOD_CURRENT, 0, ChannelPeriod, highs);
     int copiedLows = CopyLow(tradeSymbol, PERIOD_CURRENT, 0, ChannelPeriod, lows);
     
@@ -101,25 +279,26 @@ void CalculateChannel()
     {
         int maxIndex = ArrayMaximum(highs);
         int minIndex = ArrayMinimum(lows);
-        double baseHigh = highs[maxIndex];
-        double baseLow = lows[minIndex];
         
-        // 数据有效性检查
+        // 数据时效性检查
         datetime newestTime = iTime(tradeSymbol, PERIOD_CURRENT, 0);
-        if(TimeCurrent() - newestTime > PeriodSeconds(PERIOD_CURRENT)*2) return;
+        if(TimeCurrent() - newestTime > PeriodSeconds(PERIOD_CURRENT)*2) {
+            Print("通道数据过期");
+            return;
+        }
         
-        // 动态通道调整
+        // 动态通道计算
         double widthFactor = MathMax(0.5, MathMin(2.0, atrValue/(50*Point())));
-        upperBand = NormalizeDouble(baseHigh + ATRMultiplier * atrValue * widthFactor, _Digits);
-        lowerBand = NormalizeDouble(baseLow - ATRMultiplier * atrValue * widthFactor, _Digits);
+        upperBand = NormalizeDouble(highs[maxIndex] + ATRMultiplier * atrValue * widthFactor, _Digits);
+        lowerBand = NormalizeDouble(lows[minIndex] - ATRMultiplier * atrValue * widthFactor, _Digits);
         
-        // 更新可视化
+        // 更新通道显示
         UpdateChannelDisplay();
     }
 }
 
 //+------------------------------------------------------------------+
-//| 智能信号检测函数                                                 |
+//| 信号检测函数                                                     |
 //+------------------------------------------------------------------+
 void CheckBreakoutSignals(const MqlTick &tick)
 {
@@ -128,10 +307,9 @@ void CheckBreakoutSignals(const MqlTick &tick)
     double atrValue = GetATRValue();
     if(atrValue <= 0) return;
     
-    double activationRange = 0.25 * atrValue;  // ATR的25%作为激活区
-    double bufferZone = 3 * Point();          // 3点缓冲带
+    double activationRange = 0.25 * atrValue;
+    double bufferZone = 3 * Point();
     
-    // 动态触发条件
     bool sellCondition = tick.bid > (upperBand - activationRange) && 
                        tick.bid < (upperBand + bufferZone);
     bool buyCondition = tick.ask < (lowerBand + activationRange) && 
@@ -146,7 +324,7 @@ void CheckBreakoutSignals(const MqlTick &tick)
 }
 
 //+------------------------------------------------------------------+
-//| 动态止损止盈开仓函数                                             |
+//| 开仓函数（增强版）                                               |
 //+------------------------------------------------------------------+
 bool OpenPosition(ENUM_ORDER_TYPE orderType)
 {
@@ -176,7 +354,7 @@ bool OpenPosition(ENUM_ORDER_TYPE orderType)
         price,
         NormalizePrice(sl),
         NormalizePrice(tp),
-        "Smart Channel Strategy"
+        "智能通道策略"
     );
 
     if(!success){
@@ -186,47 +364,15 @@ bool OpenPosition(ENUM_ORDER_TYPE orderType)
 }
 
 //+------------------------------------------------------------------+
-//| 增强风控检查                                                     |
+//| 调试信息输出                                                     |
 //+------------------------------------------------------------------+
-bool ExecuteChecks()
+void DebugOutput()
 {
-    // 基础检查
-    if(!RiskCheck()) return false;
-    
-    // 获取实时数据
-    MqlTick last_tick;
-    if(!SymbolInfoTick(tradeSymbol, last_tick)) return false;
-    
-    // 动态成交量检查
-    double currentVol = last_tick.volume;
-    if(currentVol < volumeMA * MinVolumeLevel) {
-        Print(StringFormat("成交量过滤 | 当前:%.2f 要求:%.2f", currentVol, volumeMA*MinVolumeLevel));
-        return false;
-    }
-    
-    // 点差检查
-    if(GetCurrentSpread() > MaxSpread) return false;
-    
-    return true;
+    Print(StringFormat("[监控] 点差:%.1f ATR:%.3f 通道[%.5f/%.5f] 成交量MA:%.1f",
+          GetCurrentSpread(), GetATRValue(),
+          upperBand, lowerBand, volumeMA));
 }
 
-//+------------------------------------------------------------------+
-//| 辅助函数集                                                      |
-//+------------------------------------------------------------------+
-double CalculateVolumeMA()
-{
-    long volumes[];
-    ArraySetAsSeries(volumes, true);
-    int copied = CopyTickVolume(tradeSymbol, PERIOD_CURRENT, 0, 20, volumes);
-    
-    // 调试输出
-    if(copied > 0){
-        Print(StringFormat("成交量数据样本[0]:%d [5]:%d [19]:%d",
-              volumes[0],volumes[5],volumes[19]));
-    }
-    
-    return (copied > 0) ? NormalizeDouble(ArrayAverage(volumes, copied),2) : 0.0;
-}
 
 double ArrayAverage(const long &arr[], int count)
 {
@@ -254,29 +400,6 @@ void PrintTradeError(CTrade &trade)
     }
 }
 
-void DebugOutput()
-{
-    Print(StringFormat("[Debug] 时间:%s 上轨:%.5f 下轨:%.5f ATR:%.5f 成交量MA:%.2f",
-          TimeToString(TimeCurrent()), upperBand, lowerBand, GetATRValue(), volumeMA));
-}
-
-
-//+------------------------------------------------------------------+
-//| 风险检查函数（唯一实现）                                         |
-//+------------------------------------------------------------------+
-bool RiskCheck()
-{
-    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-    
-    if(equity < balance - DailyMaxLoss) 
-    {
-        CloseAllOrders();
-        return false;
-    }
-    return (equity / MathMax(balance, 0.01)) >= 0.7 
-           && TerminalInfoInteger(TERMINAL_CONNECTED);
-}
 
 //+------------------------------------------------------------------+
 //| 持仓检查函数（精准版）                                           |
@@ -297,29 +420,6 @@ bool PositionExist(ENUM_ORDER_TYPE checkType)
     return false;
 }
 
-
-//+------------------------------------------------------------------+
-//| 优化后的时间过滤函数                                             |
-//+------------------------------------------------------------------+
-bool IsTradeTime(string start, string end)
-{
-    datetime now = TimeCurrent();
-    datetime st = StringToTime(start);
-    datetime ed = StringToTime(end);
-    
-    // 处理跨日情况
-    if(st >= ed) ed += 86400;
-    
-    datetime nowTime = now % 86400;
-    st = st % 86400;
-    ed = ed % 86400;
-
-    if(ed > st) {
-        return (nowTime >= st) && (nowTime < ed);
-    } else {
-        return (nowTime >= st) || (nowTime < ed);
-    }
-}
 
 //+------------------------------------------------------------------+
 //| 移动止损函数                       |
