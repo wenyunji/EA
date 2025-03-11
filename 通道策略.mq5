@@ -81,7 +81,7 @@ int OnInit()
 }
 
 //+------------------------------------------------------------------+
-//| 成交量MA计算函数（已修复）                                       |
+//| 成交量MA计算函数（已修复参数错误）                               |
 //+------------------------------------------------------------------+
 double CalculateVolumeMA()
 {
@@ -89,11 +89,11 @@ double CalculateVolumeMA()
     int copied = 0;
     
     if(UseBarVolume) {
-        // 使用K线成交量（回测兼容）
+        // 使用K线成交量（正确参数）
         copied = CopyRealVolume(tradeSymbol, PERIOD_CURRENT, 0, 20, volumes);
     } else {
-        // 使用Tick成交量（实时交易）
-        copied = CopyTickVolume(tradeSymbol, PERIOD_CURRENT, COPY_TICKS_ALL, 0, 20, volumes);
+        // 使用Tick成交量（修正参数顺序）
+        copied = CopyTickVolume(tradeSymbol, COPY_TICKS_ALL, 0, 20, volumes);
     }
 
     if(copied <= 0) {
@@ -167,26 +167,6 @@ CHECK_RESULT ExecuteChecks()
     
     return CHECK_PASS;
 }
-
-// ...（其他函数保持与之前提供的完整代码一致，包括：RiskCheck、CalculateChannel、CheckBreakoutSignals、OpenPosition、DebugOutput等所有函数）...
-
-// 确保包含所有辅助函数实现：
-// - GetDefaultVolume
-// - IsTradeTime
-// - ArrayAverage
-// - UpdateChannelDisplay
-// - PrintTradeError
-// - PositionExist
-// - TrailStopLoss
-// - ManageOrders
-// - CloseAllOrders
-// - GetATRValue
-// - NormalizePrice
-// - GetCurrentSpread
-
-//+------------------------------------------------------------------+
-//| 成交量MA计算函数（完整修正版）                                   |
-//+------------------------------------------------------------------+
 
 //+------------------------------------------------------------------+
 //| 获取品种典型成交量值                                             |
