@@ -74,11 +74,7 @@ input group "=== Ichimoku Filter ==="
    input    int               senkou_b                = 52;             // period of SenkouSpanB
 
 
-/**
- * EA初始化函数
- * 功能：设置交易参数，初始化交易品种数组
- * 返回值：初始化状态码（INIT_SUCCEEDED/INIT_FAILED）
- */
+
 int OnInit(){
 
    trade.SetExpertMagicNumber(InpMagic);
@@ -112,11 +108,6 @@ void OnTick(){
 
 }
 
-/**
- * 核心交易逻辑函数
- * 参数 symbol：当前处理的交易品种
- * 功能：执行交易品种的指标计算、条件判断和下单操作
- */
 void RunSymbols(string symbol){
    
    if(PositionsTotal()>0){
@@ -289,12 +280,6 @@ string PricevsMovAvg(double MAfast, double MAslow){
 return "error";
 }  
 
-/**
- * 一目均衡表过滤判断函数
- * 参数 symbol：交易品种，SenA/SenB：云层边界，Ten/Kij：转换/基准线
- * 返回值："above"/"below" 表示过滤条件状态
- * 功能：根据设定类型判断价格与云层的位置关系
- */
 string PricevsIchiCloud(string symbol, double SenA, double SenB, double Ten, double Kij){
 
 
@@ -352,11 +337,6 @@ string IsSwapPositive(string symbol){
 return "error";
 }
 
-/**
- * 持仓盈利平仓函数
- * 参数 symbol：当前交易品种
- * 功能：当品种总盈利达到设定百分比时平仓所有相关持仓
- */
 void ExitPositionsinProfit(string symbol){
 
    double totalProfit = 0;
