@@ -27,7 +27,10 @@ CTrade   trade;
 int      atrHandle      = INVALID_HANDLE;
 int      emaFastHandle  = INVALID_HANDLE;
 int      emaSlowHandle  = INVALID_HANDLE;
+int      htfEmaFastHandle = INVALID_HANDLE;
+int      htfEmaSlowHandle = INVALID_HANDLE;
 datetime lastBarTime    = 0;
+datetime lastEntryTime  = 0;
 
 input group "==== 基础参数 ===="
 input ENUM_TIMEFRAMES TradeTimeframe     = PERIOD_M5;
@@ -38,6 +41,15 @@ input bool            CloseOnOpposite    = true;
 input int             MaxPositions       = 1;
 input int             MaxSpreadPoints    = 80;
 input int             TradeDeviation     = 20;
+
+input group "==== 执行过滤 ===="
+input bool            UseSessionFilter   = true;
+input string          SessionStart       = "07:00";
+input string          SessionEnd         = "23:00";
+input int             MinBarsBetweenEntries = 6;
+input int             MaxTradesPerDay    = 3;
+input bool            UseDailyLossLimit  = true;
+input double          DailyLossLimitCurrency = 200.0;
 
 input group "==== 仓位参数 ===="
 input bool            UseRiskPercent     = true;
@@ -69,7 +81,12 @@ input double          CloseStrengthSell  = 0.40;
 input group "==== 趋势与出场 ===="
 input int             EMAFastPeriod      = 34;
 input int             EMASlowPeriod      = 89;
+input bool            UseHTFFilter       = true;
+input ENUM_TIMEFRAMES HTFTimeframe       = PERIOD_M15;
+input int             HTFEMAFastPeriod   = 34;
+input int             HTFEMASlowPeriod   = 89;
 input int             ATRPeriod          = 14;
+input double          MinATRPoints       = 80.0;
 input double          StopBufferATR      = 0.25;
 input double          RewardRisk         = 2.20;
 input bool            EnableBreakEven    = true;
@@ -88,8 +105,14 @@ int OnInit()
    atrHandle = iATR(_Symbol, TradeTimeframe, ATRPeriod);
    emaFastHandle = iMA(_Symbol, TradeTimeframe, EMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
    emaSlowHandle = iMA(_Symbol, TradeTimeframe, EMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   htfEmaFastHandle = iMA(_Symbol, HTFTimeframe, HTFEMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   htfEmaSlowHandle = iMA(_Symbol, HTFTimeframe, HTFEMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
 
-   if(atrHandle == INVALID_HANDLE || emaFastHandle == INVALID_HANDLE || emaSlowHandle == INVALID_HANDLE)
+   if(atrHandle == INVALID_HANDLE ||
+      emaFastHandle == INVALID_HANDLE ||
+      emaSlowHandle == INVALID_HANDLE ||
+      htfEmaFastHandle == INVALID_HANDLE ||
+      htfEmaSlowHandle == INVALID_HANDLE)
      {
       Print("指标句柄初始化失败");
       return INIT_FAILED;
@@ -100,6 +123,7 @@ int OnInit()
    trade.SetDeviationInPoints(TradeDeviation);
 
    lastBarTime = iTime(_Symbol, TradeTimeframe, 0);
+   lastEntryTime = GetLastEntryTimeFromHistory();
    return INIT_SUCCEEDED;
   }
 
@@ -111,6 +135,10 @@ void OnDeinit(const int reason)
       IndicatorRelease(emaFastHandle);
    if(emaSlowHandle != INVALID_HANDLE)
       IndicatorRelease(emaSlowHandle);
+   if(htfEmaFastHandle != INVALID_HANDLE)
+      IndicatorRelease(htfEmaFastHandle);
+   if(htfEmaSlowHandle != INVALID_HANDLE)
+      IndicatorRelease(htfEmaSlowHandle);
   }
 
 void OnTick()
@@ -118,6 +146,9 @@ void OnTick()
    ManageOpenPositions();
 
    if(!IsNewBar())
+      return;
+
+   if(UseSessionFilter && !IsWithinTradingSession(TimeCurrent()))
       return;
 
    if(CurrentSpreadPoints() > MaxSpreadPoints)
@@ -133,16 +164,32 @@ void OnTick()
    double atrValue = 0.0;
    double emaFast = 0.0;
    double emaSlow = 0.0;
+   double htfEmaFast = 0.0;
+   double htfEmaSlow = 0.0;
    if(!GetIndicatorValue(atrHandle, 1, atrValue) ||
       !GetIndicatorValue(emaFastHandle, 1, emaFast) ||
-      !GetIndicatorValue(emaSlowHandle, 1, emaSlow))
+      !GetIndicatorValue(emaSlowHandle, 1, emaSlow) ||
+      !GetIndicatorValue(htfEmaFastHandle, 1, htfEmaFast) ||
+      !GetIndicatorValue(htfEmaSlowHandle, 1, htfEmaSlow))
      {
       Print("跳过：无法获取 ATR/EMA 数据");
       return;
      }
 
+   if(atrValue / _Point < MinATRPoints)
+     {
+      Print("跳过：波动不足，ATR点数=", DoubleToString(atrValue / _Point, 1));
+      return;
+     }
+
    bool bullishBias = emaFast > emaSlow;
    bool bearishBias = emaFast < emaSlow;
+
+   if(UseHTFFilter)
+     {
+      bullishBias = bullishBias && (htfEmaFast > htfEmaSlow);
+      bearishBias = bearishBias && (htfEmaFast < htfEmaSlow);
+     }
 
    bool buySignal = false;
    bool sellSignal = false;
@@ -182,8 +229,15 @@ void OnTick()
          return;
      }
 
-   if(managedPositions >= MaxPositions)
+   if(MaxPositions > 0 && managedPositions >= MaxPositions)
       return;
+
+   string blockReason = "";
+   if((buySignal || sellSignal) && !CanOpenNewTrade(blockReason))
+     {
+      Print("跳过开仓：", blockReason);
+      return;
+     }
 
    if(buySignal)
       OpenTrade(SIGNAL_BUY, buySetup, atrValue, "Wave+Wyckoff Buy");
@@ -206,6 +260,22 @@ bool ValidateInputs()
    if(RewardRisk <= 0.5)
       return false;
    if(ATRPeriod <= 1 || EMAFastPeriod <= 1 || EMASlowPeriod <= EMAFastPeriod)
+      return false;
+   if(HTFEMAFastPeriod <= 1 || HTFEMASlowPeriod <= HTFEMAFastPeriod)
+      return false;
+   if(UseHTFFilter && PeriodSeconds(HTFTimeframe) < PeriodSeconds(TradeTimeframe))
+      return false;
+   if(MaxPositions < 0)
+      return false;
+   if(MinBarsBetweenEntries < 0)
+      return false;
+   if(MaxTradesPerDay < 0)
+      return false;
+   if(UseDailyLossLimit && DailyLossLimitCurrency <= 0.0)
+      return false;
+   if(UseSessionFilter && (!IsValidTimeString(SessionStart) || !IsValidTimeString(SessionEnd)))
+      return false;
+   if(MinATRPoints < 0.0)
       return false;
    return true;
   }
@@ -258,6 +328,188 @@ double CurrentSpreadPoints()
    if(!SymbolInfoTick(_Symbol, tick))
       return 999999.0;
    return (tick.ask - tick.bid) / _Point;
+  }
+
+bool IsValidTimeString(string value)
+  {
+   if(StringLen(value) != 5)
+      return false;
+   if(StringSubstr(value, 2, 1) != ":")
+      return false;
+
+   for(int i = 0; i < 5; ++i)
+     {
+      if(i == 2)
+         continue;
+      int ch = StringGetCharacter(value, i);
+      if(ch < '0' || ch > '9')
+         return false;
+     }
+
+   int hour = (int)StringToInteger(StringSubstr(value, 0, 2));
+   int minute = (int)StringToInteger(StringSubstr(value, 3, 2));
+   return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+  }
+
+int ParseMinutesOfDay(string value)
+  {
+   int hour = (int)StringToInteger(StringSubstr(value, 0, 2));
+   int minute = (int)StringToInteger(StringSubstr(value, 3, 2));
+   return hour * 60 + minute;
+  }
+
+bool IsWithinTradingSession(datetime currentTime)
+  {
+   if(!UseSessionFilter)
+      return true;
+
+   int startMinutes = ParseMinutesOfDay(SessionStart);
+   int endMinutes = ParseMinutesOfDay(SessionEnd);
+
+   MqlDateTime timeStruct;
+   TimeToStruct(currentTime, timeStruct);
+   int currentMinutes = timeStruct.hour * 60 + timeStruct.min;
+
+   if(startMinutes == endMinutes)
+      return true;
+
+   if(startMinutes < endMinutes)
+      return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+
+   return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+  }
+
+datetime GetStartOfDay(datetime currentTime)
+  {
+   MqlDateTime timeStruct;
+   TimeToStruct(currentTime, timeStruct);
+   timeStruct.hour = 0;
+   timeStruct.min = 0;
+   timeStruct.sec = 0;
+   return StructToTime(timeStruct);
+  }
+
+double GetTodayRealizedPnL()
+  {
+   datetime dayStart = GetStartOfDay(TimeCurrent());
+   if(!HistorySelect(dayStart, TimeCurrent()))
+      return 0.0;
+
+   double pnl = 0.0;
+   int totalDeals = HistoryDealsTotal();
+   for(int i = 0; i < totalDeals; ++i)
+     {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0)
+         continue;
+      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != MagicNumber)
+         continue;
+
+      long entryType = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+      if(entryType != DEAL_ENTRY_OUT && entryType != DEAL_ENTRY_OUT_BY)
+         continue;
+
+      pnl += HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+      pnl += HistoryDealGetDouble(dealTicket, DEAL_SWAP);
+      pnl += HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+     }
+   return pnl;
+  }
+
+int GetTodayEntryCount()
+  {
+   datetime dayStart = GetStartOfDay(TimeCurrent());
+   if(!HistorySelect(dayStart, TimeCurrent()))
+      return 0;
+
+   int count = 0;
+   int totalDeals = HistoryDealsTotal();
+   for(int i = 0; i < totalDeals; ++i)
+     {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0)
+         continue;
+      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != MagicNumber)
+         continue;
+      if(HistoryDealGetInteger(dealTicket, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         count++;
+     }
+   return count;
+  }
+
+datetime GetLastEntryTimeFromHistory()
+  {
+   datetime fromTime = TimeCurrent() - 86400 * 30;
+   if(!HistorySelect(fromTime, TimeCurrent()))
+      return 0;
+
+   datetime latest = 0;
+   int totalDeals = HistoryDealsTotal();
+   for(int i = 0; i < totalDeals; ++i)
+     {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0)
+         continue;
+      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != MagicNumber)
+         continue;
+      if(HistoryDealGetInteger(dealTicket, DEAL_ENTRY) != DEAL_ENTRY_IN)
+         continue;
+
+      datetime dealTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+      if(dealTime > latest)
+         latest = dealTime;
+     }
+   return latest;
+  }
+
+bool IsInCooldown()
+  {
+   if(MinBarsBetweenEntries <= 0 || lastEntryTime <= 0)
+      return false;
+
+   int barsPassed = iBarShift(_Symbol, TradeTimeframe, lastEntryTime, false);
+   if(barsPassed < 0)
+      return false;
+
+   return barsPassed < MinBarsBetweenEntries;
+  }
+
+bool CanOpenNewTrade(string &reason)
+  {
+   if(UseSessionFilter && !IsWithinTradingSession(TimeCurrent()))
+     {
+      reason = "当前不在交易时段";
+      return false;
+     }
+
+   if(IsInCooldown())
+     {
+      reason = "仍在开仓冷却期";
+      return false;
+     }
+
+   int todayEntries = GetTodayEntryCount();
+   if(MaxTradesPerDay > 0 && todayEntries >= MaxTradesPerDay)
+     {
+      reason = "已达到当日最大开仓次数";
+      return false;
+     }
+
+   double todayPnL = GetTodayRealizedPnL();
+   if(UseDailyLossLimit && todayPnL <= -DailyLossLimitCurrency)
+     {
+      reason = "触发日内亏损熔断";
+      return false;
+     }
+
+   reason = "";
+   return true;
   }
 
 bool BuildBullishSignal(const MqlRates &rates[], double atrValue, WaveSetup &setup)
@@ -651,6 +903,8 @@ bool OpenTrade(SignalDirection direction, const WaveSetup &setup, double atrValu
       return false;
      }
 
+   lastEntryTime = TimeCurrent();
+
    Print(comment, " | 手数=", DoubleToString(volume, 2),
          " 入场=", DoubleToString(entryPrice, _Digits),
          " 止损=", DoubleToString(stopPrice, _Digits),
@@ -799,7 +1053,9 @@ void ManageOpenPositions()
       double marketPrice = type == POSITION_TYPE_BUY ? tick.bid : tick.ask;
       double initialRisk = 0.0;
 
-      if(currentSL > 0.0)
+      if(currentTP > 0.0 && RewardRisk > 0.0)
+         initialRisk = MathAbs(currentTP - openPrice) / RewardRisk;
+      else if(currentSL > 0.0)
          initialRisk = MathAbs(openPrice - currentSL);
 
       double newSL = currentSL;
@@ -821,14 +1077,16 @@ void ManageOpenPositions()
         {
          double trailingSL = type == POSITION_TYPE_BUY ? marketPrice - atrValue * TrailATRMultiplier
                                                        : marketPrice + atrValue * TrailATRMultiplier;
-         if(type == POSITION_TYPE_BUY)
+         bool inProfit = (type == POSITION_TYPE_BUY && marketPrice > openPrice) ||
+                         (type == POSITION_TYPE_SELL && marketPrice < openPrice);
+         if(type == POSITION_TYPE_BUY && inProfit)
            {
             if(newSL == 0.0)
                newSL = trailingSL;
             else
                newSL = MathMax(newSL, trailingSL);
            }
-         else
+         else if(type == POSITION_TYPE_SELL && inProfit)
            {
             if(newSL == 0.0)
                newSL = trailingSL;
