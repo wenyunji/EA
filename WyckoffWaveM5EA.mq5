@@ -33,66 +33,66 @@ datetime lastBarTime    = 0;
 datetime lastEntryTime  = 0;
 
 input group "==== 基础参数 ===="
-input ENUM_TIMEFRAMES TradeTimeframe     = PERIOD_M5;
-input ulong           MagicNumber        = 20260414;
-input bool            EnableLong         = true;
-input bool            EnableShort        = true;
-input bool            CloseOnOpposite    = true;
-input int             MaxPositions       = 1;
-input int             MaxSpreadPoints    = 80;
-input int             TradeDeviation     = 20;
+input ENUM_TIMEFRAMES TradeTimeframe     = PERIOD_M5;    // 交易执行周期，策略默认按 M5 设计
+input ulong           MagicNumber        = 20260414;     // EA 魔术号，用于识别本策略订单
+input bool            EnableLong         = true;         // 是否允许做多信号与多单开仓
+input bool            EnableShort        = true;         // 是否允许做空信号与空单开仓
+input bool            CloseOnOpposite    = true;         // 出现反向信号时是否优先平掉现有持仓
+input int             MaxPositions       = 1;            // 最大持仓数量，0 表示不限制
+input int             MaxSpreadPoints    = 80;           // 最大允许点差，超过后跳过该次开仓判断
+input int             TradeDeviation     = 20;           // 下单允许滑点，单位为点
 
 input group "==== 执行过滤 ===="
-input bool            UseSessionFilter   = true;
-input string          SessionStart       = "07:00";
-input string          SessionEnd         = "23:00";
-input int             MinBarsBetweenEntries = 6;
-input int             MaxTradesPerDay    = 3;
-input bool            UseDailyLossLimit  = true;
-input double          DailyLossLimitCurrency = 200.0;
+input bool            UseSessionFilter   = true;         // 是否启用交易时段过滤
+input string          SessionStart       = "06:00";    // 允许开仓的开始时间，格式 HH:MM
+input string          SessionEnd         = "23:00";    // 允许开仓的结束时间，格式 HH:MM
+input int             MinBarsBetweenEntries = 6;        // 两次开仓之间最少间隔多少根 K 线
+input int             MaxTradesPerDay    = 3;            // 每日最多允许开仓次数，0 表示不限制
+input bool            UseDailyLossLimit  = true;         // 是否启用日内亏损熔断
+input double          DailyLossLimitCurrency = 200.0;    // 日内累计亏损达到该金额后停止新开仓
 
 input group "==== 仓位参数 ===="
-input bool            UseRiskPercent     = true;
-input double          RiskPercent        = 1.0;
-input double          FixedLots          = 0.10;
+input bool            UseRiskPercent     = true;         // 是否按账户风险百分比自动计算手数
+input double          RiskPercent        = 1.0;          // 单笔交易风险占账户余额的百分比
+input double          FixedLots          = 0.10;         // 固定手数模式下使用的下单手数
 
 input group "==== 波浪参数 ===="
-input int             BarsToScan         = 260;
-input int             PivotStrength      = 3;
-input double          MinStructureATR    = 3.0;
-input double          Wave2MinRetrace    = 0.20;
-input double          Wave2MaxRetrace    = 0.79;
-input double          Wave3MinRatio      = 1.20;
-input double          Wave4MinRetrace    = 0.15;
-input double          Wave4MaxRetrace    = 0.62;
-input bool            RequireNoOverlap   = false;
-input double          BreakoutBufferATR  = 0.08;
-input double          PivotMatchATR      = 0.80;
+input int             BarsToScan         = 260;          // 每次识别波浪结构时回看多少根 K 线
+input int             PivotStrength      = 3;            // 分型强度，越大越不敏感，拐点越少
+input double          MinStructureATR    = 3.0;          // 最小结构幅度，低于该 ATR 倍数的波浪不参与
+input double          Wave2MinRetrace    = 0.20;         // 第 2 浪最小回撤比例
+input double          Wave2MaxRetrace    = 0.79;         // 第 2 浪最大回撤比例
+input double          Wave3MinRatio      = 1.20;         // 第 3 浪相对第 1 浪的最小延伸倍数
+input double          Wave4MinRetrace    = 0.15;         // 第 4 浪最小回撤比例
+input double          Wave4MaxRetrace    = 0.62;         // 第 4 浪最大回撤比例
+input bool            RequireNoOverlap   = false;        // 是否强制要求第 4 浪不与第 1 浪价格区间重叠
+input double          BreakoutBufferATR  = 0.08;         // 突破确认缓冲，按 ATR 的倍数加在突破位上
+input double          PivotMatchATR      = 0.80;         // 威科夫假突破与关键 pivot 匹配时允许的 ATR 偏差
 
 input group "==== 威科夫参数 ===="
-input int             TradingRangeBars   = 24;
-input int             WyckoffSignalBars  = 12;
-input int             VolumeLookback     = 20;
-input double          FalseBreakATR      = 0.12;
-input double          VolumeMultiplier   = 1.20;
-input double          CloseStrengthBuy   = 0.60;
-input double          CloseStrengthSell  = 0.40;
+input int             TradingRangeBars   = 24;           // 识别 spring / upthrust 时参考的震荡区间长度
+input int             WyckoffSignalBars  = 12;           // 最近多少根 K 线内查找威科夫信号
+input int             VolumeLookback     = 20;           // 成交量均值回看周期
+input double          FalseBreakATR      = 0.12;         // 假突破超出区间的最小 ATR 幅度
+input double          VolumeMultiplier   = 1.20;         // 当前成交量至少达到均量的多少倍才算有效
+input double          CloseStrengthBuy   = 0.60;         // 做多 spring 的收盘强度阈值，越大代表收盘越强
+input double          CloseStrengthSell  = 0.40;         // 做空 upthrust 的收盘强度阈值，越小代表收盘越弱
 
 input group "==== 趋势与出场 ===="
-input int             EMAFastPeriod      = 34;
-input int             EMASlowPeriod      = 89;
-input bool            UseHTFFilter       = true;
-input ENUM_TIMEFRAMES HTFTimeframe       = PERIOD_M15;
-input int             HTFEMAFastPeriod   = 34;
-input int             HTFEMASlowPeriod   = 89;
-input int             ATRPeriod          = 14;
-input double          MinATRPoints       = 80.0;
-input double          StopBufferATR      = 0.25;
-input double          RewardRisk         = 2.20;
-input bool            EnableBreakEven    = true;
-input double          BreakEvenAtRR      = 1.00;
-input bool            EnableTrailing     = true;
-input double          TrailATRMultiplier = 1.00;
+input int             EMAFastPeriod      = 34;           // 当前交易周期快 EMA 周期
+input int             EMASlowPeriod      = 89;           // 当前交易周期慢 EMA 周期
+input bool            UseHTFFilter       = true;         // 是否启用更高周期趋势共振过滤
+input ENUM_TIMEFRAMES HTFTimeframe       = PERIOD_M15;   // 更高周期趋势过滤所使用的时间框架
+input int             HTFEMAFastPeriod   = 34;           // 更高周期快 EMA 周期
+input int             HTFEMASlowPeriod   = 89;           // 更高周期慢 EMA 周期
+input int             ATRPeriod          = 14;           // ATR 波动率指标周期
+input double          MinATRPoints       = 80.0;         // 最小 ATR 点数，低于该波动阈值不交易
+input double          StopBufferATR      = 0.25;         // 止损在结构低点/高点外额外预留的 ATR 缓冲
+input double          RewardRisk         = 2.20;         // 固定止盈风险收益比
+input bool            EnableBreakEven    = true;         // 是否启用保本止损逻辑
+input double          BreakEvenAtRR      = 1.00;         // 浮盈达到多少倍初始风险后把止损推到保本
+input bool            EnableTrailing     = true;         // 是否启用 ATR 移动止损
+input double          TrailATRMultiplier = 1.00;         // 移动止损距离的 ATR 倍数
 
 int OnInit()
   {
