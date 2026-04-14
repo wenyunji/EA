@@ -11,6 +11,15 @@ enum SignalDirection
    SIGNAL_SELL
   };
 
+enum EntryModeType
+  {
+   ENTRY_AUTO = 0,
+   ENTRY_WAVE3_ONLY,
+   ENTRY_WAVE5_ONLY,
+   ENTRY_RANGE_ONLY,
+   ENTRY_WAVE3_AND_5
+  };
+
 struct WaveSetup
   {
    bool   valid;
@@ -41,6 +50,13 @@ input bool            CloseOnOpposite    = true;         // 出现反向信号�
 input int             MaxPositions       = 1;            // 最大持仓数量，0 表示不限制
 input int             MaxSpreadPoints    = 80;           // 最大允许点差，超过后跳过该次开仓判断
 input int             TradeDeviation     = 20;           // 下单允许滑点，单位为点
+
+input group "==== 多结构模式 ===="
+input EntryModeType   EntryMode          = ENTRY_AUTO;   // 入场模式：自动 / 只做3浪 / 只做5浪 / 只做区间 / 同时做3浪和5浪
+input double          Wave3MinStructureATR = 2.0;        // 识别 1-2 结构时所需的最小波幅，单位为 ATR 倍数
+input double          TrendGapATR        = 0.12;         // 识别趋势状态时，快慢 EMA 间距至少达到多少 ATR
+input double          RangeGapATR        = 0.05;         // 识别区间状态时，快慢 EMA 间距不超过多少 ATR
+input double          RangeBreakoutATR   = 0.05;         // 区间反转信号突破确认时，对信号棒高低点增加的 ATR 缓冲
 
 input group "==== 执行过滤 ===="
 input bool            UseSessionFilter   = true;         // 是否启用交易时段过滤
@@ -184,6 +200,9 @@ void OnTick()
 
    bool bullishBias = emaFast > emaSlow;
    bool bearishBias = emaFast < emaSlow;
+   double emaGap = MathAbs(emaFast - emaSlow);
+   bool trendState = emaGap >= atrValue * TrendGapATR;
+   bool rangeState = emaGap <= atrValue * RangeGapATR;
 
    if(UseHTFFilter)
      {
@@ -191,31 +210,28 @@ void OnTick()
       bearishBias = bearishBias && (htfEmaFast < htfEmaSlow);
      }
 
-   bool buySignal = false;
-   bool sellSignal = false;
    WaveSetup buySetup;
-   WaveSetup sellSetup;
    buySetup.valid = false;
-   sellSetup.valid = false;
-
-   if(EnableLong && bullishBias)
-      buySignal = BuildBullishSignal(rates, atrValue, buySetup);
-
-   if(EnableShort && bearishBias)
-      sellSignal = BuildBearishSignal(rates, atrValue, sellSetup);
-
-   if(buySignal && sellSignal)
-     {
-      Print("跳过：多空信号同时出现，放弃该根K线");
-      return;
-     }
+   SignalDirection signalDirection = SIGNAL_NONE;
+   string signalComment = "";
+   bool hasSignal = SelectTradeSignal(
+      rates,
+      atrValue,
+      bullishBias,
+      bearishBias,
+      trendState,
+      rangeState,
+      signalDirection,
+      buySetup,
+      signalComment
+   );
 
    int managedPositions = CountManagedPositions();
    if(managedPositions > 0 && CloseOnOpposite)
      {
-      if(buySignal && HasManagedPosition(POSITION_TYPE_SELL))
+      if(signalDirection == SIGNAL_BUY && HasManagedPosition(POSITION_TYPE_SELL))
          CloseManagedPositions(POSITION_TYPE_SELL);
-      else if(sellSignal && HasManagedPosition(POSITION_TYPE_BUY))
+      else if(signalDirection == SIGNAL_SELL && HasManagedPosition(POSITION_TYPE_BUY))
          CloseManagedPositions(POSITION_TYPE_BUY);
 
       managedPositions = CountManagedPositions();
@@ -223,9 +239,9 @@ void OnTick()
 
    if(managedPositions > 0)
      {
-      if(buySignal && HasManagedPosition(POSITION_TYPE_SELL))
+      if(signalDirection == SIGNAL_BUY && HasManagedPosition(POSITION_TYPE_SELL))
          return;
-      if(sellSignal && HasManagedPosition(POSITION_TYPE_BUY))
+      if(signalDirection == SIGNAL_SELL && HasManagedPosition(POSITION_TYPE_BUY))
          return;
      }
 
@@ -233,16 +249,14 @@ void OnTick()
       return;
 
    string blockReason = "";
-   if((buySignal || sellSignal) && !CanOpenNewTrade(blockReason))
+   if(hasSignal && !CanOpenNewTrade(blockReason))
      {
       Print("跳过开仓：", blockReason);
       return;
      }
 
-   if(buySignal)
-      OpenTrade(SIGNAL_BUY, buySetup, atrValue, "Wave+Wyckoff Buy");
-   else if(sellSignal)
-      OpenTrade(SIGNAL_SELL, sellSetup, atrValue, "Wave+Wyckoff Sell");
+   if(hasSignal)
+      OpenTrade(signalDirection, buySetup, atrValue, signalComment);
   }
 
 bool ValidateInputs()
@@ -258,6 +272,12 @@ bool ValidateInputs()
    if(TradingRangeBars < 10 || WyckoffSignalBars < 3)
       return false;
    if(RewardRisk <= 0.5)
+      return false;
+   if(Wave3MinStructureATR <= 0.0)
+      return false;
+   if(TrendGapATR < 0.0 || RangeGapATR < 0.0 || RangeBreakoutATR < 0.0)
+      return false;
+   if(TrendGapATR <= RangeGapATR)
       return false;
    if(ATRPeriod <= 1 || EMAFastPeriod <= 1 || EMASlowPeriod <= EMAFastPeriod)
       return false;
@@ -512,7 +532,204 @@ bool CanOpenNewTrade(string &reason)
    return true;
   }
 
-bool BuildBullishSignal(const MqlRates &rates[], double atrValue, WaveSetup &setup)
+bool SelectWave3Signal(const MqlRates &rates[], double atrValue, bool bullishBias, bool bearishBias,
+                       SignalDirection &direction, WaveSetup &setup, string &comment)
+  {
+   WaveSetup signalSetup;
+   signalSetup.valid = false;
+
+   if(EnableLong && bullishBias && BuildBullishWave3Signal(rates, atrValue, signalSetup))
+     {
+      direction = SIGNAL_BUY;
+      setup = signalSetup;
+      comment = "Wave3 Buy";
+      return true;
+     }
+
+   signalSetup.valid = false;
+   if(EnableShort && bearishBias && BuildBearishWave3Signal(rates, atrValue, signalSetup))
+     {
+      direction = SIGNAL_SELL;
+      setup = signalSetup;
+      comment = "Wave3 Sell";
+      return true;
+     }
+
+   direction = SIGNAL_NONE;
+   comment = "";
+   return false;
+  }
+
+bool SelectWave5Signal(const MqlRates &rates[], double atrValue, bool bullishBias, bool bearishBias,
+                       SignalDirection &direction, WaveSetup &setup, string &comment)
+  {
+   WaveSetup signalSetup;
+   signalSetup.valid = false;
+
+   if(EnableLong && bullishBias && BuildBullishWave5Signal(rates, atrValue, signalSetup))
+     {
+      direction = SIGNAL_BUY;
+      setup = signalSetup;
+      comment = "Wave5 Buy";
+      return true;
+     }
+
+   signalSetup.valid = false;
+   if(EnableShort && bearishBias && BuildBearishWave5Signal(rates, atrValue, signalSetup))
+     {
+      direction = SIGNAL_SELL;
+      setup = signalSetup;
+      comment = "Wave5 Sell";
+      return true;
+     }
+
+   direction = SIGNAL_NONE;
+   comment = "";
+   return false;
+  }
+
+bool SelectRangeSignal(const MqlRates &rates[], double atrValue,
+                       SignalDirection &direction, WaveSetup &setup, string &comment)
+  {
+   WaveSetup buySetup;
+   WaveSetup sellSetup;
+   buySetup.valid = false;
+   sellSetup.valid = false;
+
+   bool hasBuy = EnableLong && BuildBullishRangeSignal(rates, atrValue, buySetup);
+   bool hasSell = EnableShort && BuildBearishRangeSignal(rates, atrValue, sellSetup);
+
+   if(hasBuy && hasSell)
+     {
+      direction = SIGNAL_NONE;
+      comment = "";
+      return false;
+     }
+
+   if(hasBuy)
+     {
+      direction = SIGNAL_BUY;
+      setup = buySetup;
+      comment = "Range Spring Buy";
+      return true;
+     }
+
+   if(hasSell)
+     {
+      direction = SIGNAL_SELL;
+      setup = sellSetup;
+      comment = "Range Upthrust Sell";
+      return true;
+     }
+
+   direction = SIGNAL_NONE;
+   comment = "";
+   return false;
+  }
+
+bool SelectTradeSignal(const MqlRates &rates[], double atrValue, bool bullishBias, bool bearishBias,
+                       bool trendState, bool rangeState,
+                       SignalDirection &direction, WaveSetup &setup, string &comment)
+  {
+   direction = SIGNAL_NONE;
+   setup.valid = false;
+   comment = "";
+
+   if(EntryMode == ENTRY_WAVE3_ONLY)
+      return SelectWave3Signal(rates, atrValue, bullishBias, bearishBias, direction, setup, comment);
+
+   if(EntryMode == ENTRY_WAVE5_ONLY)
+      return SelectWave5Signal(rates, atrValue, bullishBias, bearishBias, direction, setup, comment);
+
+   if(EntryMode == ENTRY_RANGE_ONLY)
+      return SelectRangeSignal(rates, atrValue, direction, setup, comment);
+
+   if(EntryMode == ENTRY_WAVE3_AND_5)
+     {
+      if(SelectWave3Signal(rates, atrValue, bullishBias, bearishBias, direction, setup, comment))
+         return true;
+      return SelectWave5Signal(rates, atrValue, bullishBias, bearishBias, direction, setup, comment);
+     }
+
+   if(trendState)
+     {
+      if(SelectWave3Signal(rates, atrValue, bullishBias, bearishBias, direction, setup, comment))
+         return true;
+      if(SelectWave5Signal(rates, atrValue, bullishBias, bearishBias, direction, setup, comment))
+         return true;
+     }
+
+   if(rangeState)
+     {
+      if(SelectRangeSignal(rates, atrValue, direction, setup, comment))
+         return true;
+     }
+
+   if(SelectWave3Signal(rates, atrValue, bullishBias, bearishBias, direction, setup, comment))
+      return true;
+   if(SelectWave5Signal(rates, atrValue, bullishBias, bearishBias, direction, setup, comment))
+      return true;
+   if(!trendState && SelectRangeSignal(rates, atrValue, direction, setup, comment))
+      return true;
+
+   direction = SIGNAL_NONE;
+   comment = "";
+   return false;
+  }
+
+bool BuildBullishWave3Signal(const MqlRates &rates[], double atrValue, WaveSetup &setup)
+  {
+   if(!FindBullishWave3(rates, atrValue, setup))
+      return false;
+
+   int springIndex = -1;
+   double springLow = 0.0;
+   if(!FindSpring(rates, atrValue, setup.pivot2, springIndex, springLow))
+      return false;
+
+   int lastClosed = ArraySize(rates) - 2;
+   int prevClosed = lastClosed - 1;
+   if(prevClosed < 0)
+      return false;
+
+   if(rates[lastClosed].close <= setup.breakout_level)
+      return false;
+   if(rates[prevClosed].close > setup.breakout_level)
+      return false;
+   if(rates[lastClosed].close <= rates[lastClosed].open)
+      return false;
+
+   setup.stop_anchor = MathMin(setup.stop_anchor, springLow);
+   return true;
+  }
+
+bool BuildBearishWave3Signal(const MqlRates &rates[], double atrValue, WaveSetup &setup)
+  {
+   if(!FindBearishWave3(rates, atrValue, setup))
+      return false;
+
+   int upthrustIndex = -1;
+   double upthrustHigh = 0.0;
+   if(!FindUpthrust(rates, atrValue, setup.pivot2, upthrustIndex, upthrustHigh))
+      return false;
+
+   int lastClosed = ArraySize(rates) - 2;
+   int prevClosed = lastClosed - 1;
+   if(prevClosed < 0)
+      return false;
+
+   if(rates[lastClosed].close >= setup.breakout_level)
+      return false;
+   if(rates[prevClosed].close < setup.breakout_level)
+      return false;
+   if(rates[lastClosed].close >= rates[lastClosed].open)
+      return false;
+
+   setup.stop_anchor = MathMax(setup.stop_anchor, upthrustHigh);
+   return true;
+  }
+
+bool BuildBullishWave5Signal(const MqlRates &rates[], double atrValue, WaveSetup &setup)
   {
    if(!FindBullishWave(rates, atrValue, setup))
       return false;
@@ -540,7 +757,7 @@ bool BuildBullishSignal(const MqlRates &rates[], double atrValue, WaveSetup &set
    return true;
   }
 
-bool BuildBearishSignal(const MqlRates &rates[], double atrValue, WaveSetup &setup)
+bool BuildBearishWave5Signal(const MqlRates &rates[], double atrValue, WaveSetup &setup)
   {
    if(!FindBearishWave(rates, atrValue, setup))
       return false;
@@ -565,6 +782,68 @@ bool BuildBearishSignal(const MqlRates &rates[], double atrValue, WaveSetup &set
       return false;
 
    setup.stop_anchor = MathMax(setup.stop_anchor, upthrustHigh);
+   return true;
+  }
+
+bool BuildBullishRangeSignal(const MqlRates &rates[], double atrValue, WaveSetup &setup)
+  {
+   int signalIndex = -1;
+   double springLow = 0.0;
+   if(!FindRangeSpring(rates, atrValue, signalIndex, springLow))
+      return false;
+
+   int lastClosed = ArraySize(rates) - 2;
+   int prevClosed = lastClosed - 1;
+   if(prevClosed < 0 || signalIndex < 0)
+      return false;
+
+   double breakoutLevel = rates[signalIndex].high + atrValue * RangeBreakoutATR;
+   if(rates[lastClosed].close <= breakoutLevel)
+      return false;
+   if(rates[prevClosed].close > breakoutLevel)
+      return false;
+   if(rates[lastClosed].close <= rates[lastClosed].open)
+      return false;
+
+   setup.valid = true;
+   setup.pivot0 = signalIndex;
+   setup.pivot1 = -1;
+   setup.pivot2 = -1;
+   setup.pivot3 = -1;
+   setup.pivot4 = -1;
+   setup.breakout_level = breakoutLevel;
+   setup.stop_anchor = springLow;
+   return true;
+  }
+
+bool BuildBearishRangeSignal(const MqlRates &rates[], double atrValue, WaveSetup &setup)
+  {
+   int signalIndex = -1;
+   double upthrustHigh = 0.0;
+   if(!FindRangeUpthrust(rates, atrValue, signalIndex, upthrustHigh))
+      return false;
+
+   int lastClosed = ArraySize(rates) - 2;
+   int prevClosed = lastClosed - 1;
+   if(prevClosed < 0 || signalIndex < 0)
+      return false;
+
+   double breakoutLevel = rates[signalIndex].low - atrValue * RangeBreakoutATR;
+   if(rates[lastClosed].close >= breakoutLevel)
+      return false;
+   if(rates[prevClosed].close < breakoutLevel)
+      return false;
+   if(rates[lastClosed].close >= rates[lastClosed].open)
+      return false;
+
+   setup.valid = true;
+   setup.pivot0 = signalIndex;
+   setup.pivot1 = -1;
+   setup.pivot2 = -1;
+   setup.pivot3 = -1;
+   setup.pivot4 = -1;
+   setup.breakout_level = breakoutLevel;
+   setup.stop_anchor = upthrustHigh;
    return true;
   }
 
@@ -688,6 +967,94 @@ bool FindBearishWave(const MqlRates &rates[], double atrValue, WaveSetup &setup)
    return false;
   }
 
+bool FindBullishWave3(const MqlRates &rates[], double atrValue, WaveSetup &setup)
+  {
+   int pivotIndex[];
+   double pivotPrice[];
+   int pivotType[];
+   CollectPivots(rates, pivotIndex, pivotPrice, pivotType);
+
+   int total = ArraySize(pivotIndex);
+   if(total < 3)
+      return false;
+
+   for(int start = total - 3; start >= 0; --start)
+     {
+      if(pivotType[start] != -1 || pivotType[start + 1] != 1 || pivotType[start + 2] != -1)
+         continue;
+
+      double low0 = pivotPrice[start];
+      double high1 = pivotPrice[start + 1];
+      double low2 = pivotPrice[start + 2];
+      double wave1 = high1 - low0;
+      double wave2Retrace = wave1 > 0.0 ? (high1 - low2) / wave1 : 0.0;
+
+      if(wave1 <= 0.0)
+         continue;
+      if(wave1 < atrValue * Wave3MinStructureATR)
+         continue;
+      if(low2 <= low0)
+         continue;
+      if(wave2Retrace < Wave2MinRetrace || wave2Retrace > Wave2MaxRetrace)
+         continue;
+
+      setup.valid = true;
+      setup.pivot0 = pivotIndex[start];
+      setup.pivot1 = pivotIndex[start + 1];
+      setup.pivot2 = pivotIndex[start + 2];
+      setup.pivot3 = -1;
+      setup.pivot4 = -1;
+      setup.breakout_level = high1 + atrValue * BreakoutBufferATR;
+      setup.stop_anchor = low2;
+      return true;
+     }
+   return false;
+  }
+
+bool FindBearishWave3(const MqlRates &rates[], double atrValue, WaveSetup &setup)
+  {
+   int pivotIndex[];
+   double pivotPrice[];
+   int pivotType[];
+   CollectPivots(rates, pivotIndex, pivotPrice, pivotType);
+
+   int total = ArraySize(pivotIndex);
+   if(total < 3)
+      return false;
+
+   for(int start = total - 3; start >= 0; --start)
+     {
+      if(pivotType[start] != 1 || pivotType[start + 1] != -1 || pivotType[start + 2] != 1)
+         continue;
+
+      double high0 = pivotPrice[start];
+      double low1 = pivotPrice[start + 1];
+      double high2 = pivotPrice[start + 2];
+      double wave1 = high0 - low1;
+      double wave2Retrace = wave1 > 0.0 ? (high2 - low1) / wave1 : 0.0;
+
+      if(wave1 <= 0.0)
+         continue;
+      if(wave1 < atrValue * Wave3MinStructureATR)
+         continue;
+      if(high2 >= high0)
+         continue;
+      if(wave2Retrace < Wave2MinRetrace || wave2Retrace > Wave2MaxRetrace)
+         continue;
+
+      setup.valid = true;
+      setup.pivot0 = pivotIndex[start];
+      setup.pivot1 = pivotIndex[start + 1];
+      setup.pivot2 = pivotIndex[start + 2];
+      setup.pivot3 = -1;
+      setup.pivot4 = -1;
+      setup.breakout_level = low1 - atrValue * BreakoutBufferATR;
+      setup.stop_anchor = high2;
+      return true;
+     }
+   return false;
+  }
+
 void CollectPivots(const MqlRates &rates[], int &indices[], double &prices[], int &types[])
   {
    ArrayResize(indices, 0);
@@ -806,6 +1173,68 @@ bool FindUpthrust(const MqlRates &rates[], double atrValue, int pivotIndex, int 
       bool volumeOk = avgVolume <= 0.0 || GetVolume(rates[bar]) >= avgVolume * VolumeMultiplier;
 
       if(nearPivot && hasFalseBreak && reject && closeStrength <= CloseStrengthSell && volumeOk)
+        {
+         signalIndex = bar;
+         upthrustHigh = rates[bar].high;
+         return true;
+        }
+     }
+   return false;
+  }
+
+bool FindRangeSpring(const MqlRates &rates[], double atrValue, int &signalIndex, double &springLow)
+  {
+   int lastClosed = ArraySize(rates) - 2;
+   int signalEnd = lastClosed - 1;
+   if(signalEnd < TradingRangeBars)
+      return false;
+
+   int startBar = MathMax(TradingRangeBars, signalEnd - WyckoffSignalBars + 1);
+   for(int bar = startBar; bar <= signalEnd; ++bar)
+     {
+      double support = LowestLow(rates, bar - TradingRangeBars, bar - 1);
+      double avgVolume = AverageVolume(rates, MathMax(0, bar - VolumeLookback), bar - 1);
+      double barRange = rates[bar].high - rates[bar].low;
+      if(barRange <= 0.0)
+         continue;
+
+      double closeStrength = (rates[bar].close - rates[bar].low) / barRange;
+      bool hasFalseBreak = rates[bar].low < support - atrValue * FalseBreakATR;
+      bool reclaim = rates[bar].close > support;
+      bool volumeOk = avgVolume <= 0.0 || GetVolume(rates[bar]) >= avgVolume * VolumeMultiplier;
+
+      if(hasFalseBreak && reclaim && closeStrength >= CloseStrengthBuy && volumeOk)
+        {
+         signalIndex = bar;
+         springLow = rates[bar].low;
+         return true;
+        }
+     }
+   return false;
+  }
+
+bool FindRangeUpthrust(const MqlRates &rates[], double atrValue, int &signalIndex, double &upthrustHigh)
+  {
+   int lastClosed = ArraySize(rates) - 2;
+   int signalEnd = lastClosed - 1;
+   if(signalEnd < TradingRangeBars)
+      return false;
+
+   int startBar = MathMax(TradingRangeBars, signalEnd - WyckoffSignalBars + 1);
+   for(int bar = startBar; bar <= signalEnd; ++bar)
+     {
+      double resistance = HighestHigh(rates, bar - TradingRangeBars, bar - 1);
+      double avgVolume = AverageVolume(rates, MathMax(0, bar - VolumeLookback), bar - 1);
+      double barRange = rates[bar].high - rates[bar].low;
+      if(barRange <= 0.0)
+         continue;
+
+      double closeStrength = (rates[bar].close - rates[bar].low) / barRange;
+      bool hasFalseBreak = rates[bar].high > resistance + atrValue * FalseBreakATR;
+      bool reject = rates[bar].close < resistance;
+      bool volumeOk = avgVolume <= 0.0 || GetVolume(rates[bar]) >= avgVolume * VolumeMultiplier;
+
+      if(hasFalseBreak && reject && closeStrength <= CloseStrengthSell && volumeOk)
         {
          signalIndex = bar;
          upthrustHigh = rates[bar].high;
