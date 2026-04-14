@@ -1,0 +1,81 @@
+developer_instructions = "请使用中文回答,务必使用清晰详细准确的风格。"
+
+model_provider = "custom"
+model = "gpt-5.4"
+review_model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+model_verbosity = "high"
+model_context_window = 1000000
+model_auto_compact_token_limit = 350000
+tool_output_token_limit = 40000
+network_access = "enabled"
+plan_mode_reasoning_effort = "xhigh"
+model_reasoning_summary = "detailed"
+model_supports_reasoning_summaries = true
+service_tier = "fast"
+approvals_reviewer = "user"
+sandbox_mode = "workspace-write"
+personality = "pragmatic"
+web_search = "live"
+approval_policy = "never"
+suppress_unstable_features_warning = true
+
+[features]
+memories = true
+sqlite = true
+multi_agent = true
+fast_mode = true
+responses_websockets_v2 = true
+
+[memories]
+consolidation_model = "gpt-5.4"
+extract_model = "gpt-5.4"
+max_raw_memories_for_consolidation = 512
+max_unused_days = 30
+max_rollout_age_days = 45
+
+
+[agents]
+max_threads = 8
+max_depth = 1
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://10.68.41.31:8317/v1"
+
+[mcp_servers]
+
+[mcp_servers.context7]
+type = "stdio"
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+
+[mcp_servers.ace-tool]
+type = "stdio"
+command = "npx"
+args = ["ace-tool", "--base-url", "https://d16.api.augmentcode.com/", "--token", "39af06452728fc15eb739bb132865c49e3d84208a302b17fbd4e9955b782c903", "--enable-log"]
+
+[mcp_servers.ace-tool.env]
+NO_PROXY = "*"
+http_proxy = ""
+https_proxy = ""
+
+[mcp_servers.exa]
+type = "http"
+url = "https://mcp.exa.ai/mcp"
+
+[mcp_servers.chrome-devtools]
+type = "stdio"
+command = "npx"
+args = ["chrome-devtools-mcp@latest"]
+
+[notice]
+hide_rate_limit_model_nudge = true
+hide_full_access_warning = true
+
+[tui]
+notifications = true
+status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-remaining", "five-hour-limit", "codex-version", "context-window-size", "used-tokens", "session-id"]
